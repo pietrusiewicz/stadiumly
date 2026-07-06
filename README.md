@@ -23,6 +23,12 @@ Stadiumly helps users create waypoint lists, navigate to places, and mark them a
 - Local persistence for saved waypoints and visit state
 - Optional sync/auth later
 
+## Repository hygiene
+
+Public source code is fine for this project, but release signing files, tokens,
+API keys, `.env` files, and private user data must stay out of git. See
+[docs/repository-hygiene.md](docs/repository-hygiene.md) for the full split.
+
 ## First milestone
 
 - Create a Flutter app shell

@@ -22,3 +22,15 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Secrets and release signing
+.env
+.env.*
+*.jks
+*.keystore
+key.properties
+android/key.properties
+android/app/key.properties
+
+# Local machine configuration
+local.properties
