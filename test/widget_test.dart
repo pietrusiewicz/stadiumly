@@ -8,6 +8,7 @@ void main() {
 
     expect(find.text('Stadiumly'), findsOneWidget);
     expect(find.text('Waypoints'), findsOneWidget);
-    expect(find.text('Visited 0/1'), findsOneWidget);
+    expect(find.text('National Stadium'), findsOneWidget);
+    expect(find.text('1/3'), findsOneWidget);
   });
 }
