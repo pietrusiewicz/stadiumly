@@ -1,5 +1,9 @@
+import 'dart:convert';
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 
 void main() {
@@ -32,6 +36,10 @@ class Waypoint {
     required this.name,
     required this.position,
     required this.category,
+    this.province = '',
+    this.county = '',
+    this.municipality = '',
+    this.city = '',
     this.visited = false,
   });
 
@@ -39,18 +47,101 @@ class Waypoint {
   final String name;
   final LatLng position;
   final String category;
+  final String province;
+  final String county;
+  final String municipality;
+  final String city;
   final bool visited;
 
-  Waypoint copyWith({String? name, String? category, bool? visited}) {
+  Waypoint copyWith({
+    String? name,
+    LatLng? position,
+    String? category,
+    String? province,
+    String? county,
+    String? municipality,
+    String? city,
+    bool? visited,
+  }) {
     return Waypoint(
       id: id,
       name: name ?? this.name,
-      position: position,
+      position: position ?? this.position,
       category: category ?? this.category,
+      province: province ?? this.province,
+      county: county ?? this.county,
+      municipality: municipality ?? this.municipality,
+      city: city ?? this.city,
       visited: visited ?? this.visited,
     );
   }
 }
+
+class AdminDivision {
+  const AdminDivision({
+    this.province = '',
+    this.county = '',
+    this.municipality = '',
+    this.city = '',
+  });
+
+  final String province;
+  final String county;
+  final String municipality;
+  final String city;
+}
+
+Future<AdminDivision?> _lookupAdminDivision(LatLng position) async {
+  final uri = Uri.https('nominatim.openstreetmap.org', '/reverse', {
+    'format': 'jsonv2',
+    'lat': position.latitude.toStringAsFixed(6),
+    'lon': position.longitude.toStringAsFixed(6),
+    'addressdetails': '1',
+    'accept-language': 'pl',
+  });
+
+  try {
+    final response = await http
+        .get(uri, headers: const {'Accept': 'application/json'})
+        .timeout(const Duration(seconds: 4));
+
+    if (response.statusCode != 200) {
+      return null;
+    }
+
+    final payload = jsonDecode(response.body);
+    if (payload is! Map<String, dynamic>) {
+      return null;
+    }
+
+    final address = payload['address'];
+    if (address is! Map<String, dynamic>) {
+      return null;
+    }
+
+    String valueOf(String key) => (address[key] as String?)?.trim() ?? '';
+    final city = valueOf('city').isNotEmpty
+        ? valueOf('city')
+        : valueOf('town').isNotEmpty
+        ? valueOf('town')
+        : valueOf('village');
+
+    return AdminDivision(
+      province: valueOf('state'),
+      county: valueOf('county').isNotEmpty ? valueOf('county') : city,
+      municipality: valueOf('municipality').isNotEmpty
+          ? valueOf('municipality')
+          : valueOf('city_district').isNotEmpty
+          ? valueOf('city_district')
+          : city,
+      city: city,
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+enum VisitScope { province, county, municipality }
 
 class WaypointMapScreen extends StatefulWidget {
   const WaypointMapScreen({super.key});
@@ -68,6 +159,10 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       name: 'National Stadium',
       category: 'Match day',
       position: LatLng(52.2394, 21.0458),
+      province: 'Mazowieckie',
+      county: 'Warszawa',
+      municipality: 'Warszawa',
+      city: 'Warszawa',
       visited: true,
     ),
     const Waypoint(
@@ -75,39 +170,220 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       name: 'Old Town meeting point',
       category: 'Walk',
       position: LatLng(52.2499, 21.0122),
+      province: 'Mazowieckie',
+      county: 'Warszawa',
+      municipality: 'Warszawa',
+      city: 'Warszawa',
     ),
     const Waypoint(
       id: 3,
       name: 'Riverside checkpoint',
       category: 'Route',
       position: LatLng(52.2356, 21.0314),
+      province: 'Mazowieckie',
+      county: 'Warszawa',
+      municipality: 'Warszawa',
+      city: 'Warszawa',
     ),
   ];
 
   int _nextWaypointId = 4;
+  VisitScope _visitScope = VisitScope.province;
 
-  int get _visitedCount =>
-      _waypoints.where((waypoint) => waypoint.visited).length;
+  String _scopeValue(Waypoint waypoint) {
+    return switch (_visitScope) {
+      VisitScope.province => waypoint.province.trim(),
+      VisitScope.county => waypoint.county.trim(),
+      VisitScope.municipality => waypoint.municipality.trim(),
+    };
+  }
 
-  double get _progress =>
-      _waypoints.isEmpty ? 0 : _visitedCount / _waypoints.length;
+  String get _scopeLabel {
+    return switch (_visitScope) {
+      VisitScope.province => 'Wojewodztwo',
+      VisitScope.county => 'Powiat',
+      VisitScope.municipality => 'Gmina',
+    };
+  }
 
-  void _addWaypoint(TapPosition _, LatLng position) {
+  String get _activeAreaName {
+    for (final waypoint in _waypoints) {
+      final value = _scopeValue(waypoint);
+      if (value.isNotEmpty) {
+        return value;
+      }
+    }
+
+    return 'No area data';
+  }
+
+  Iterable<Waypoint> get _activeAreaWaypoints {
+    final areaName = _activeAreaName;
+    return _waypoints.where((waypoint) => _scopeValue(waypoint) == areaName);
+  }
+
+  int get _areaVisitedCount =>
+      _activeAreaWaypoints.where((waypoint) => waypoint.visited).length;
+
+  int get _areaTotalCount => _activeAreaWaypoints.length;
+
+  double get _progress {
+    return _areaTotalCount == 0 ? 0 : _areaVisitedCount / _areaTotalCount;
+  }
+
+  Waypoint? _editingWaypoint;
+  LatLng _draftPosition = _initialCenter;
+  int _editorRevision = 0;
+  int _adminLookupRevision = 0;
+  bool _adminMode = false;
+  bool _editorOpen = false;
+
+  void _startCreateAt(
+    TapPosition _,
+    LatLng position, {
+    bool lookupAdmin = true,
+  }) {
+    if (!_adminMode) {
+      return;
+    }
+
     setState(() {
-      final id = _nextWaypointId++;
-      _waypoints.add(
-        Waypoint(
-          id: id,
-          name: 'Waypoint $id',
-          category: 'New stop',
-          position: position,
-        ),
-      );
+      _editingWaypoint = null;
+      _draftPosition = position;
+      _editorOpen = true;
+      _editorRevision++;
+      if (lookupAdmin) {
+        _adminLookupRevision++;
+      }
+    });
+  }
+
+  void _setAdminMode(bool value) {
+    setState(() {
+      _adminMode = value;
+      if (!_adminMode) {
+        _editingWaypoint = null;
+        _editorOpen = false;
+        _editorRevision++;
+      }
     });
   }
 
   void _addCenterWaypoint() {
-    _addWaypoint(TapPosition(Offset.zero, Offset.zero), _initialCenter);
+    _startCreateAt(
+      TapPosition(Offset.zero, Offset.zero),
+      _initialCenter,
+      lookupAdmin: false,
+    );
+  }
+
+  void _editWaypoint(Waypoint waypoint) {
+    setState(() {
+      _editingWaypoint = waypoint;
+      _draftPosition = waypoint.position;
+      _editorOpen = true;
+      _editorRevision++;
+    });
+  }
+
+  void _closeEditor() {
+    setState(() {
+      _editingWaypoint = null;
+      _editorOpen = false;
+      _editorRevision++;
+    });
+  }
+
+  void _saveWaypoint({
+    required int? id,
+    required String name,
+    required String category,
+    required LatLng position,
+    required String province,
+    required String county,
+    required String municipality,
+    required String city,
+    required bool visited,
+  }) {
+    late final int savedId;
+    final shouldLookupAdmin =
+        province.isEmpty &&
+        county.isEmpty &&
+        municipality.isEmpty &&
+        city.isEmpty;
+
+    setState(() {
+      if (id == null) {
+        final nextId = _nextWaypointId++;
+        savedId = nextId;
+        _waypoints.add(
+          Waypoint(
+            id: nextId,
+            name: name,
+            category: category,
+            position: position,
+            province: province,
+            county: county,
+            municipality: municipality,
+            city: city,
+            visited: visited,
+          ),
+        );
+      } else {
+        savedId = id;
+        final index = _waypoints.indexWhere((item) => item.id == id);
+        if (index != -1) {
+          _waypoints[index] = _waypoints[index].copyWith(
+            name: name,
+            category: category,
+            position: position,
+            province: province,
+            county: county,
+            municipality: municipality,
+            city: city,
+            visited: visited,
+          );
+        }
+      }
+
+      _editingWaypoint = null;
+      _draftPosition = position;
+      _editorOpen = false;
+      _editorRevision++;
+    });
+
+    if (shouldLookupAdmin) {
+      _enrichWaypointAdminData(savedId, position);
+    }
+  }
+
+  Future<void> _enrichWaypointAdminData(int id, LatLng position) async {
+    final division = await _lookupAdminDivision(position);
+    if (!mounted || division == null) {
+      return;
+    }
+
+    setState(() {
+      final index = _waypoints.indexWhere((item) => item.id == id);
+      if (index == -1) {
+        return;
+      }
+
+      final waypoint = _waypoints[index];
+      if (waypoint.province.isNotEmpty ||
+          waypoint.county.isNotEmpty ||
+          waypoint.municipality.isNotEmpty ||
+          waypoint.city.isNotEmpty) {
+        return;
+      }
+
+      _waypoints[index] = waypoint.copyWith(
+        province: division.province,
+        county: division.county,
+        municipality: division.municipality,
+        city: division.city,
+      );
+    });
   }
 
   void _toggleVisited(Waypoint waypoint) {
@@ -121,9 +397,20 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
     });
   }
 
+  void _setVisitScope(VisitScope scope) {
+    setState(() {
+      _visitScope = scope;
+    });
+  }
+
   void _deleteWaypoint(Waypoint waypoint) {
     setState(() {
       _waypoints.removeWhere((item) => item.id == waypoint.id);
+      if (_editingWaypoint?.id == waypoint.id) {
+        _editingWaypoint = null;
+        _editorOpen = false;
+        _editorRevision++;
+      }
     });
   }
 
@@ -136,7 +423,7 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
             options: MapOptions(
               initialCenter: _initialCenter,
               initialZoom: 13,
-              onTap: _addWaypoint,
+              onTap: _startCreateAt,
             ),
             children: [
               TileLayer(
@@ -155,6 +442,13 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
                         onPressed: () => _toggleVisited(waypoint),
                       ),
                     ),
+                  if (_adminMode && _editorOpen)
+                    Marker(
+                      point: _draftPosition,
+                      width: 62,
+                      height: 62,
+                      child: const _DraftWaypointMarker(),
+                    ),
                 ],
               ),
             ],
@@ -163,9 +457,13 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: _TripSummary(
-                visitedCount: _visitedCount,
-                totalCount: _waypoints.length,
+                areaName: _activeAreaName,
+                scopeLabel: _scopeLabel,
+                scope: _visitScope,
+                visitedCount: _areaVisitedCount,
+                totalCount: _areaTotalCount,
                 progress: _progress,
+                onScopeChanged: _setVisitScope,
               ),
             ),
           ),
@@ -175,7 +473,17 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
               minimum: const EdgeInsets.fromLTRB(12, 0, 12, 12),
               child: _WaypointPanel(
                 waypoints: _waypoints,
+                adminMode: _adminMode,
+                editorOpen: _editorOpen,
+                editingWaypoint: _editingWaypoint,
+                draftPosition: _draftPosition,
+                editorRevision: _editorRevision,
+                adminLookupRevision: _adminLookupRevision,
+                onAdminModeChanged: _setAdminMode,
                 onAddWaypoint: _addCenterWaypoint,
+                onCloseEditor: _closeEditor,
+                onEdit: _editWaypoint,
+                onSave: _saveWaypoint,
                 onToggleVisited: _toggleVisited,
                 onDelete: _deleteWaypoint,
               ),
@@ -189,14 +497,22 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
 
 class _TripSummary extends StatelessWidget {
   const _TripSummary({
+    required this.areaName,
+    required this.scopeLabel,
+    required this.scope,
     required this.visitedCount,
     required this.totalCount,
     required this.progress,
+    required this.onScopeChanged,
   });
 
+  final String areaName;
+  final String scopeLabel;
+  final VisitScope scope;
   final int visitedCount;
   final int totalCount;
   final double progress;
+  final ValueChanged<VisitScope> onScopeChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -221,21 +537,24 @@ class _TripSummary extends StatelessWidget {
                     color: colors.primaryContainer,
                     borderRadius: BorderRadius.circular(8),
                   ),
-                  child: Icon(Icons.route, color: colors.onPrimaryContainer),
+                  padding: const EdgeInsets.all(7),
+                  child: _AreaShapeIcon(scope: scope, areaName: areaName),
                 ),
                 const SizedBox(width: 12),
-                const Expanded(
+                Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Stadiumly',
-                        style: TextStyle(
+                        areaName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
                           fontSize: 21,
                           fontWeight: FontWeight.w800,
                         ),
                       ),
-                      Text('Plan, visit, remember.'),
+                      Text('Visited in $scopeLabel'),
                     ],
                   ),
                 ),
@@ -248,7 +567,35 @@ class _TripSummary extends StatelessWidget {
                 ),
               ],
             ),
-            const SizedBox(height: 14),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: SegmentedButton<VisitScope>(
+                    segments: const [
+                      ButtonSegment(
+                        value: VisitScope.province,
+                        label: Text('Woj'),
+                      ),
+                      ButtonSegment(
+                        value: VisitScope.county,
+                        label: Text('Powiat'),
+                      ),
+                      ButtonSegment(
+                        value: VisitScope.municipality,
+                        label: Text('Gmina'),
+                      ),
+                    ],
+                    selected: {scope},
+                    showSelectedIcon: false,
+                    onSelectionChanged: (selection) {
+                      onScopeChanged(selection.single);
+                    },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
             ClipRRect(
               borderRadius: BorderRadius.circular(999),
               child: LinearProgressIndicator(
@@ -261,6 +608,162 @@ class _TripSummary extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+class _AreaShapeIcon extends StatelessWidget {
+  const _AreaShapeIcon({required this.scope, required this.areaName});
+
+  final VisitScope scope;
+  final String areaName;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
+    return CustomPaint(
+      painter: _AreaShapePainter(
+        scope: scope,
+        areaName: areaName,
+        fillColor: colors.primary,
+        strokeColor: colors.onPrimaryContainer,
+      ),
+    );
+  }
+}
+
+class _AreaShapePainter extends CustomPainter {
+  const _AreaShapePainter({
+    required this.scope,
+    required this.areaName,
+    required this.fillColor,
+    required this.strokeColor,
+  });
+
+  final VisitScope scope;
+  final String areaName;
+  final Color fillColor;
+  final Color strokeColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final shape = _shapeFor(scope, areaName);
+    final path = ui.Path()
+      ..moveTo(shape.first.dx * size.width, shape.first.dy * size.height);
+
+    for (final point in shape.skip(1)) {
+      path.lineTo(point.dx * size.width, point.dy * size.height);
+    }
+
+    path.close();
+
+    final shadowPath = path.shift(const Offset(0, 1));
+    canvas.drawPath(
+      shadowPath,
+      Paint()
+        ..color = Colors.black.withValues(alpha: 0.12)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = fillColor
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = strokeColor.withValues(alpha: 0.58)
+        ..strokeWidth = 1.4
+        ..style = PaintingStyle.stroke
+        ..strokeJoin = StrokeJoin.round,
+    );
+  }
+
+  List<Offset> _shapeFor(VisitScope scope, String areaName) {
+    final normalized = areaName.toLowerCase();
+
+    if (scope == VisitScope.province && normalized.contains('mazowieck')) {
+      return const [
+        Offset(0.34, 0.04),
+        Offset(0.57, 0.09),
+        Offset(0.72, 0.22),
+        Offset(0.90, 0.39),
+        Offset(0.78, 0.55),
+        Offset(0.82, 0.78),
+        Offset(0.55, 0.94),
+        Offset(0.40, 0.80),
+        Offset(0.18, 0.86),
+        Offset(0.08, 0.62),
+        Offset(0.20, 0.45),
+        Offset(0.14, 0.24),
+      ];
+    }
+
+    if (normalized.contains('warszawa')) {
+      return switch (scope) {
+        VisitScope.county => const [
+          Offset(0.42, 0.05),
+          Offset(0.72, 0.12),
+          Offset(0.87, 0.36),
+          Offset(0.77, 0.66),
+          Offset(0.54, 0.91),
+          Offset(0.30, 0.82),
+          Offset(0.12, 0.56),
+          Offset(0.20, 0.24),
+        ],
+        VisitScope.municipality => const [
+          Offset(0.50, 0.04),
+          Offset(0.74, 0.17),
+          Offset(0.91, 0.48),
+          Offset(0.70, 0.83),
+          Offset(0.42, 0.95),
+          Offset(0.12, 0.70),
+          Offset(0.16, 0.30),
+        ],
+        VisitScope.province => const [
+          Offset(0.24, 0.12),
+          Offset(0.72, 0.10),
+          Offset(0.88, 0.44),
+          Offset(0.58, 0.90),
+          Offset(0.18, 0.74),
+        ],
+      };
+    }
+
+    return switch (scope) {
+      VisitScope.province => const [
+        Offset(0.24, 0.08),
+        Offset(0.70, 0.12),
+        Offset(0.91, 0.45),
+        Offset(0.63, 0.91),
+        Offset(0.16, 0.78),
+        Offset(0.09, 0.34),
+      ],
+      VisitScope.county => const [
+        Offset(0.33, 0.09),
+        Offset(0.78, 0.18),
+        Offset(0.87, 0.62),
+        Offset(0.52, 0.93),
+        Offset(0.13, 0.63),
+        Offset(0.18, 0.27),
+      ],
+      VisitScope.municipality => const [
+        Offset(0.50, 0.06),
+        Offset(0.85, 0.34),
+        Offset(0.73, 0.83),
+        Offset(0.28, 0.88),
+        Offset(0.10, 0.38),
+      ],
+    };
+  }
+
+  @override
+  bool shouldRepaint(covariant _AreaShapePainter oldDelegate) {
+    return oldDelegate.scope != scope ||
+        oldDelegate.areaName != areaName ||
+        oldDelegate.fillColor != fillColor ||
+        oldDelegate.strokeColor != strokeColor;
   }
 }
 
@@ -306,22 +809,484 @@ class _WaypointMarker extends StatelessWidget {
   }
 }
 
-class _WaypointPanel extends StatelessWidget {
+class _DraftWaypointMarker extends StatelessWidget {
+  const _DraftWaypointMarker();
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
+    return Tooltip(
+      message: 'Selected location',
+      child: Container(
+        decoration: BoxDecoration(
+          color: colors.primaryContainer,
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white, width: 4),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.24),
+              blurRadius: 12,
+              offset: const Offset(0, 5),
+            ),
+          ],
+        ),
+        padding: const EdgeInsets.all(7),
+        child: CircleAvatar(
+          backgroundColor: colors.primary,
+          child: const Icon(Icons.add_location_alt, color: Colors.white),
+        ),
+      ),
+    );
+  }
+}
+
+typedef _WaypointSave =
+    void Function({
+      required int? id,
+      required String name,
+      required String category,
+      required LatLng position,
+      required String province,
+      required String county,
+      required String municipality,
+      required String city,
+      required bool visited,
+    });
+
+class _WaypointPanel extends StatefulWidget {
   const _WaypointPanel({
     required this.waypoints,
+    required this.adminMode,
+    required this.editorOpen,
+    required this.editingWaypoint,
+    required this.draftPosition,
+    required this.editorRevision,
+    required this.adminLookupRevision,
+    required this.onAdminModeChanged,
     required this.onAddWaypoint,
+    required this.onCloseEditor,
+    required this.onEdit,
+    required this.onSave,
     required this.onToggleVisited,
     required this.onDelete,
   });
 
   final List<Waypoint> waypoints;
+  final bool adminMode;
+  final bool editorOpen;
+  final Waypoint? editingWaypoint;
+  final LatLng draftPosition;
+  final int editorRevision;
+  final int adminLookupRevision;
+  final ValueChanged<bool> onAdminModeChanged;
   final VoidCallback onAddWaypoint;
+  final VoidCallback onCloseEditor;
+  final ValueChanged<Waypoint> onEdit;
+  final _WaypointSave onSave;
   final ValueChanged<Waypoint> onToggleVisited;
   final ValueChanged<Waypoint> onDelete;
 
   @override
+  State<_WaypointPanel> createState() => _WaypointPanelState();
+}
+
+class _WaypointPanelState extends State<_WaypointPanel> {
+  final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
+  final _categoryController = TextEditingController();
+  final _latitudeController = TextEditingController();
+  final _longitudeController = TextEditingController();
+  final _provinceController = TextEditingController();
+  final _countyController = TextEditingController();
+  final _municipalityController = TextEditingController();
+  final _cityController = TextEditingController();
+
+  int? _activeId;
+  int _loadedRevision = -1;
+  int _lookupRevision = 0;
+  bool _visited = false;
+  bool _adminLookupPending = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadEditor();
+  }
+
+  @override
+  void didUpdateWidget(covariant _WaypointPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.editorRevision != widget.editorRevision) {
+      _loadEditor();
+    }
+    if (oldWidget.adminLookupRevision != widget.adminLookupRevision) {
+      _refreshAdminFields(force: true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _categoryController.dispose();
+    _latitudeController.dispose();
+    _longitudeController.dispose();
+    _provinceController.dispose();
+    _countyController.dispose();
+    _municipalityController.dispose();
+    _cityController.dispose();
+    super.dispose();
+  }
+
+  void _loadEditor() {
+    final waypoint = widget.editingWaypoint;
+
+    _activeId = waypoint?.id;
+    _visited = waypoint?.visited ?? false;
+    _nameController.text = waypoint?.name ?? '';
+    _categoryController.text = waypoint?.category ?? '';
+    _latitudeController.text = (waypoint?.position ?? widget.draftPosition)
+        .latitude
+        .toStringAsFixed(6);
+    _longitudeController.text = (waypoint?.position ?? widget.draftPosition)
+        .longitude
+        .toStringAsFixed(6);
+    _provinceController.text = waypoint?.province ?? '';
+    _countyController.text = waypoint?.county ?? '';
+    _municipalityController.text = waypoint?.municipality ?? '';
+    _cityController.text = waypoint?.city ?? '';
+    _loadedRevision = widget.editorRevision;
+  }
+
+  double? _coordinateFrom(String value) {
+    return double.tryParse(value.trim().replaceAll(',', '.'));
+  }
+
+  String? _requiredText(String? value) {
+    if (value == null || value.trim().isEmpty) {
+      return 'Required';
+    }
+
+    return null;
+  }
+
+  String? _latitudeError(String? value) {
+    final parsed = _coordinateFrom(value ?? '');
+    if (parsed == null) {
+      return 'Enter latitude';
+    }
+    if (parsed < -90 || parsed > 90) {
+      return 'Use -90 to 90';
+    }
+
+    return null;
+  }
+
+  String? _longitudeError(String? value) {
+    final parsed = _coordinateFrom(value ?? '');
+    if (parsed == null) {
+      return 'Enter longitude';
+    }
+    if (parsed < -180 || parsed > 180) {
+      return 'Use -180 to 180';
+    }
+
+    return null;
+  }
+
+  bool get _adminFieldsEmpty {
+    return _provinceController.text.trim().isEmpty &&
+        _countyController.text.trim().isEmpty &&
+        _municipalityController.text.trim().isEmpty &&
+        _cityController.text.trim().isEmpty;
+  }
+
+  LatLng? _positionFromForm() {
+    final latitude = _coordinateFrom(_latitudeController.text);
+    final longitude = _coordinateFrom(_longitudeController.text);
+    if (latitude == null || longitude == null) {
+      return null;
+    }
+
+    return LatLng(latitude, longitude);
+  }
+
+  void _applyAdminDivision(AdminDivision division, {required bool force}) {
+    void apply(TextEditingController controller, String value) {
+      if (force || controller.text.trim().isEmpty) {
+        controller.text = value;
+      }
+    }
+
+    apply(_provinceController, division.province);
+    apply(_countyController, division.county);
+    apply(_municipalityController, division.municipality);
+    apply(_cityController, division.city);
+  }
+
+  Future<void> _refreshAdminFields({bool force = false}) async {
+    final position = _positionFromForm();
+    if (position == null || (!force && !_adminFieldsEmpty)) {
+      return;
+    }
+
+    final lookupId = ++_lookupRevision;
+    setState(() {
+      _adminLookupPending = true;
+    });
+
+    final division = await _lookupAdminDivision(position);
+    if (!mounted || lookupId != _lookupRevision) {
+      return;
+    }
+
+    setState(() {
+      if (division != null) {
+        _applyAdminDivision(division, force: force);
+      }
+      _adminLookupPending = false;
+    });
+  }
+
+  void _save() {
+    if (!(_formKey.currentState?.validate() ?? false)) {
+      return;
+    }
+
+    widget.onSave(
+      id: _activeId,
+      name: _nameController.text.trim(),
+      category: _categoryController.text.trim(),
+      position: LatLng(
+        _coordinateFrom(_latitudeController.text)!,
+        _coordinateFrom(_longitudeController.text)!,
+      ),
+      province: _provinceController.text.trim(),
+      county: _countyController.text.trim(),
+      municipality: _municipalityController.text.trim(),
+      city: _cityController.text.trim(),
+      visited: _visited,
+    );
+  }
+
+  InputDecoration _compactDecoration(String label) {
+    return InputDecoration(
+      labelText: label,
+      border: const OutlineInputBorder(),
+      isDense: true,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+    );
+  }
+
+  String get _adminSummaryText {
+    final values = [
+      _provinceController.text.trim(),
+      _countyController.text.trim(),
+      _municipalityController.text.trim(),
+      _cityController.text.trim(),
+    ].where((value) => value.isNotEmpty).toList();
+
+    if (values.isEmpty) {
+      return 'Will be added after save';
+    }
+
+    return values.join(' / ');
+  }
+
+  Widget _buildEditorForm(bool isEditing, ColorScheme colors) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+      child: Form(
+        key: _formKey,
+        autovalidateMode: AutovalidateMode.onUserInteraction,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    isEditing ? 'Edit object' : 'Create object',
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                Text(
+                  _loadedRevision == widget.editorRevision
+                      ? 'Tap map or enter lat/lon'
+                      : '',
+                  style: TextStyle(
+                    color: colors.onSurfaceVariant,
+                    fontSize: 12,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Close editor',
+                  onPressed: widget.onCloseEditor,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 36,
+                    height: 36,
+                  ),
+                  padding: EdgeInsets.zero,
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final nameField = TextFormField(
+                  controller: _nameController,
+                  decoration: _compactDecoration('Name'),
+                  validator: _requiredText,
+                );
+                final categoryField = TextFormField(
+                  controller: _categoryController,
+                  decoration: _compactDecoration('Category'),
+                  validator: _requiredText,
+                );
+
+                if (constraints.maxWidth < 480) {
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      nameField,
+                      const SizedBox(height: 8),
+                      categoryField,
+                    ],
+                  );
+                }
+
+                return Row(
+                  children: [
+                    Expanded(child: nameField),
+                    const SizedBox(width: 10),
+                    Expanded(child: categoryField),
+                  ],
+                );
+              },
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: TextFormField(
+                    controller: _latitudeController,
+                    decoration: _compactDecoration('Latitude'),
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                      signed: true,
+                    ),
+                    validator: _latitudeError,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: TextFormField(
+                    controller: _longitudeController,
+                    decoration: _compactDecoration('Longitude'),
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                      signed: true,
+                    ),
+                    validator: _longitudeError,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _adminLookupPending
+                        ? 'Loading administrative data...'
+                        : 'Admin: $_adminSummaryText',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: colors.onSurfaceVariant,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Refresh administrative data',
+                  onPressed: _adminLookupPending
+                      ? null
+                      : () => _refreshAdminFields(force: true),
+                  constraints: const BoxConstraints.tightFor(
+                    width: 36,
+                    height: 32,
+                  ),
+                  padding: EdgeInsets.zero,
+                  icon: _adminLookupPending
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.travel_explore, size: 20),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Checkbox(
+                  value: _visited,
+                  onChanged: (value) {
+                    setState(() {
+                      _visited = value ?? false;
+                    });
+                  },
+                ),
+                const Expanded(child: Text('Visited')),
+                FilledButton.icon(
+                  onPressed: _save,
+                  icon: Icon(isEditing ? Icons.save : Icons.add),
+                  label: Text(isEditing ? 'Update' : 'Create'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWaypointList() {
+    if (widget.waypoints.isEmpty) {
+      return const Center(child: Text('No objects yet'));
+    }
+
+    return ListView.separated(
+      padding: EdgeInsets.zero,
+      shrinkWrap: true,
+      itemCount: widget.waypoints.length,
+      separatorBuilder: (_, _) => const Divider(height: 1),
+      itemBuilder: (context, index) {
+        final waypoint = widget.waypoints[index];
+
+        return _WaypointTile(
+          waypoint: waypoint,
+          adminMode: widget.adminMode,
+          onEdit: () => widget.onEdit(waypoint),
+          onToggleVisited: () => widget.onToggleVisited(waypoint),
+          onDelete: () => widget.onDelete(waypoint),
+        );
+      },
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
+    final isEditing = _activeId != null;
 
     return Material(
       elevation: 10,
@@ -347,37 +1312,45 @@ class _WaypointPanel extends StatelessWidget {
                     ),
                   ),
                   Text(
-                    '${waypoints.length} stops',
+                    '${widget.waypoints.length} objects',
                     style: TextStyle(color: colors.onSurfaceVariant),
                   ),
                   const SizedBox(width: 8),
-                  FilledButton.icon(
-                    onPressed: onAddWaypoint,
-                    icon: const Icon(Icons.add_location_alt, size: 18),
-                    label: const Text('Add'),
+                  SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(
+                        value: false,
+                        icon: Icon(Icons.person_outline, size: 18),
+                        label: Text('User'),
+                      ),
+                      ButtonSegment(
+                        value: true,
+                        icon: Icon(Icons.admin_panel_settings, size: 18),
+                        label: Text('Admin'),
+                      ),
+                    ],
+                    selected: {widget.adminMode},
+                    showSelectedIcon: false,
+                    onSelectionChanged: (selection) {
+                      widget.onAdminModeChanged(selection.single);
+                    },
                   ),
+                  if (widget.adminMode) ...[
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      onPressed: widget.onAddWaypoint,
+                      icon: const Icon(Icons.add_location_alt, size: 18),
+                      label: const Text('New'),
+                    ),
+                  ],
                 ],
               ),
             ),
             const Divider(height: 1),
             Flexible(
-              child: waypoints.isEmpty
-                  ? const Center(child: Text('No waypoints yet'))
-                  : ListView.separated(
-                      padding: EdgeInsets.zero,
-                      shrinkWrap: true,
-                      itemCount: waypoints.length,
-                      separatorBuilder: (_, _) => const Divider(height: 1),
-                      itemBuilder: (context, index) {
-                        final waypoint = waypoints[index];
-
-                        return _WaypointTile(
-                          waypoint: waypoint,
-                          onToggleVisited: () => onToggleVisited(waypoint),
-                          onDelete: () => onDelete(waypoint),
-                        );
-                      },
-                    ),
+              child: widget.adminMode && widget.editorOpen
+                  ? _buildEditorForm(isEditing, colors)
+                  : _buildWaypointList(),
             ),
           ],
         ),
@@ -389,17 +1362,27 @@ class _WaypointPanel extends StatelessWidget {
 class _WaypointTile extends StatelessWidget {
   const _WaypointTile({
     required this.waypoint,
+    required this.adminMode,
+    required this.onEdit,
     required this.onToggleVisited,
     required this.onDelete,
   });
 
   final Waypoint waypoint;
+  final bool adminMode;
+  final VoidCallback onEdit;
   final VoidCallback onToggleVisited;
   final VoidCallback onDelete;
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
+    final adminSummary = [
+      waypoint.city,
+      waypoint.municipality,
+      waypoint.county,
+      waypoint.province,
+    ].where((value) => value.trim().isNotEmpty).join(' / ');
 
     return ListTile(
       contentPadding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
@@ -419,14 +1402,28 @@ class _WaypointTile extends StatelessWidget {
       subtitle: Text(
         '${waypoint.category} - '
         '${waypoint.position.latitude.toStringAsFixed(4)}, '
-        '${waypoint.position.longitude.toStringAsFixed(4)}',
+        '${waypoint.position.longitude.toStringAsFixed(4)}'
+        '${adminSummary.isEmpty ? '' : '\n$adminSummary'}',
       ),
-      trailing: IconButton(
-        tooltip: 'Delete waypoint',
-        onPressed: onDelete,
-        color: colors.onSurfaceVariant,
-        icon: const Icon(Icons.delete_outline),
-      ),
+      trailing: adminMode
+          ? Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  tooltip: 'Edit object',
+                  onPressed: onEdit,
+                  color: colors.onSurfaceVariant,
+                  icon: const Icon(Icons.edit_outlined),
+                ),
+                IconButton(
+                  tooltip: 'Delete object',
+                  onPressed: onDelete,
+                  color: colors.onSurfaceVariant,
+                  icon: const Icon(Icons.delete_outline),
+                ),
+              ],
+            )
+          : null,
     );
   }
 }
