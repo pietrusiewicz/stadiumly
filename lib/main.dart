@@ -92,6 +92,12 @@ class AdminDivision {
   final String city;
 }
 
+class AdminBoundary {
+  const AdminBoundary({required this.polygons});
+
+  final List<List<LatLng>> polygons;
+}
+
 double _distanceBetweenMeters(LatLng from, LatLng to) {
   const earthRadiusMeters = 6371000.0;
   final fromLat = from.latitude * math.pi / 180;
@@ -171,6 +177,198 @@ Future<AdminDivision?> _lookupAdminDivision(LatLng position) async {
   } catch (_) {
     return null;
   }
+}
+
+Future<AdminBoundary?> _lookupAdminBoundary({
+  required VisitScope scope,
+  required String areaName,
+  LatLng? near,
+}) async {
+  final query = switch (scope) {
+    VisitScope.province => '$areaName wojewodztwo Polska',
+    VisitScope.county => '$areaName powiat Polska',
+    VisitScope.municipality => '$areaName gmina Polska',
+  };
+  final uri = Uri.https('nominatim.openstreetmap.org', '/search', {
+    'format': 'jsonv2',
+    'q': query,
+    'addressdetails': '1',
+    'polygon_geojson': '1',
+    'limit': '8',
+    'countrycodes': 'pl',
+    'accept-language': 'pl',
+  });
+
+  try {
+    final response = await http
+        .get(uri, headers: const {'Accept': 'application/json'})
+        .timeout(const Duration(seconds: 5));
+
+    if (response.statusCode != 200) {
+      return null;
+    }
+
+    final payload = jsonDecode(response.body);
+    if (payload is! List) {
+      return null;
+    }
+
+    List<List<LatLng>> bestPolygons = const [];
+    var bestScore = -1.0;
+
+    for (final item in payload) {
+      if (item is! Map<String, dynamic>) {
+        continue;
+      }
+
+      final geojson = item['geojson'];
+      final polygons = _polygonsFromGeoJson(geojson);
+      if (polygons.isEmpty) {
+        continue;
+      }
+
+      final score =
+          _boundaryCandidateScore(item, scope, areaName, near) +
+          _polygonWeight(polygons);
+      if (score > bestScore) {
+        bestScore = score;
+        bestPolygons = polygons;
+      }
+    }
+
+    if (bestPolygons.isEmpty) {
+      return null;
+    }
+
+    return AdminBoundary(polygons: bestPolygons);
+  } catch (_) {
+    return null;
+  }
+}
+
+double _boundaryCandidateScore(
+  Map<String, dynamic> item,
+  VisitScope scope,
+  String areaName,
+  LatLng? near,
+) {
+  var score = 0.0;
+  final itemClass = (item['class'] as String?)?.toLowerCase() ?? '';
+  final type = (item['type'] as String?)?.toLowerCase() ?? '';
+  final displayName = (item['display_name'] as String?)?.toLowerCase() ?? '';
+  final normalizedArea = areaName.toLowerCase();
+
+  if (itemClass == 'boundary') {
+    score += 20;
+  }
+  if (type == 'administrative') {
+    score += 20;
+  }
+  if (displayName.contains(normalizedArea)) {
+    score += 12;
+  }
+
+  final address = item['address'];
+  if (address is Map<String, dynamic>) {
+    final scopedAddress = switch (scope) {
+      VisitScope.province => address['state'],
+      VisitScope.county => address['county'],
+      VisitScope.municipality => address['municipality'] ?? address['city'],
+    };
+    if ((scopedAddress as String?)?.toLowerCase().contains(normalizedArea) ??
+        false) {
+      score += 30;
+    }
+  }
+
+  if (near != null) {
+    final latitude = double.tryParse((item['lat'] as String?) ?? '');
+    final longitude = double.tryParse((item['lon'] as String?) ?? '');
+    if (latitude != null && longitude != null) {
+      final distance = _distanceBetweenMeters(
+        near,
+        LatLng(latitude, longitude),
+      );
+      score += math.max(0, 20 - distance / 25000);
+    }
+  }
+
+  return score;
+}
+
+double _polygonWeight(List<List<LatLng>> polygons) {
+  final points = polygons.fold<int>(
+    0,
+    (total, polygon) => total + polygon.length,
+  );
+  return math.min(points / 200, 8);
+}
+
+List<List<LatLng>> _polygonsFromGeoJson(Object? geojson) {
+  if (geojson is! Map<String, dynamic>) {
+    return const [];
+  }
+
+  final type = geojson['type'];
+  final coordinates = geojson['coordinates'];
+  if (type == 'Polygon') {
+    final polygon = _polygonOuterRing(coordinates);
+    return polygon.isEmpty ? const [] : [polygon];
+  }
+  if (type == 'MultiPolygon' && coordinates is List) {
+    final polygons = <List<LatLng>>[];
+    for (final polygonCoordinates in coordinates) {
+      final polygon = _polygonOuterRing(polygonCoordinates);
+      if (polygon.isNotEmpty) {
+        polygons.add(polygon);
+      }
+    }
+    polygons.sort((a, b) => b.length.compareTo(a.length));
+    return polygons.take(6).toList(growable: false);
+  }
+
+  return const [];
+}
+
+List<LatLng> _polygonOuterRing(Object? coordinates) {
+  if (coordinates is! List || coordinates.isEmpty) {
+    return const [];
+  }
+
+  final outerRing = coordinates.first;
+  if (outerRing is! List) {
+    return const [];
+  }
+
+  final points = <LatLng>[];
+  for (final coordinate in outerRing) {
+    if (coordinate is List && coordinate.length >= 2) {
+      final longitude = (coordinate[0] as num?)?.toDouble();
+      final latitude = (coordinate[1] as num?)?.toDouble();
+      if (latitude != null && longitude != null) {
+        points.add(LatLng(latitude, longitude));
+      }
+    }
+  }
+
+  return _thinPolygon(points, maxPoints: 700);
+}
+
+List<LatLng> _thinPolygon(List<LatLng> points, {required int maxPoints}) {
+  if (points.length <= maxPoints) {
+    return points;
+  }
+
+  final step = (points.length / maxPoints).ceil();
+  final thinned = <LatLng>[];
+  for (var index = 0; index < points.length; index += step) {
+    thinned.add(points[index]);
+  }
+  if (thinned.first != points.last) {
+    thinned.add(points.last);
+  }
+
+  return thinned;
 }
 
 enum VisitScope { province, county, municipality }
@@ -287,6 +485,60 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
     return _waypoints.where((waypoint) => _scopeValue(waypoint) == areaName);
   }
 
+  List<List<LatLng>> get _activeAreaShapes {
+    if (_activeBoundaryPolygons.isNotEmpty) {
+      return _activeBoundaryPolygons;
+    }
+
+    final positions = _activeAreaWaypoints
+        .map((waypoint) => waypoint.position)
+        .toList(growable: false);
+    if (positions.isNotEmpty) {
+      return [_areaShapeAround(positions)];
+    }
+
+    final focusedPosition = _focusedPosition;
+    if (focusedPosition != null) {
+      return [
+        _areaShapeAround([focusedPosition]),
+      ];
+    }
+
+    return const [];
+  }
+
+  String get _activeBoundaryKey => '$_visitScope:$_activeAreaName';
+
+  LatLng? get _activeAreaRepresentativePosition {
+    final selectedWaypoint = _selectedWaypoint;
+    if (selectedWaypoint != null) {
+      return selectedWaypoint.position;
+    }
+
+    final focusedPosition = _focusedPosition;
+    if (focusedPosition != null) {
+      return focusedPosition;
+    }
+
+    final waypoints = _activeAreaWaypoints.toList(growable: false);
+    if (waypoints.isEmpty) {
+      return null;
+    }
+
+    final latitude =
+        waypoints
+            .map((waypoint) => waypoint.position.latitude)
+            .reduce((sum, latitude) => sum + latitude) /
+        waypoints.length;
+    final longitude =
+        waypoints
+            .map((waypoint) => waypoint.position.longitude)
+            .reduce((sum, longitude) => sum + longitude) /
+        waypoints.length;
+
+    return LatLng(latitude, longitude);
+  }
+
   int get _areaVisitedCount =>
       _activeAreaWaypoints.where((waypoint) => waypoint.visited).length;
 
@@ -304,7 +556,22 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   bool _editorOpen = false;
   int? _selectedWaypointId;
   AdminDivision? _focusedDivision;
+  LatLng? _focusedPosition;
   int _areaLookupRevision = 0;
+  final Map<String, List<List<LatLng>>> _boundaryCache = {};
+  List<List<LatLng>> _activeBoundaryPolygons = const [];
+  String _loadedBoundaryKey = '';
+  int _boundaryLookupRevision = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _refreshAreaBoundary();
+      }
+    });
+  }
 
   Waypoint? get _selectedWaypoint {
     final id = _selectedWaypointId;
@@ -337,6 +604,7 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       _editorOpen = true;
       _selectedWaypointId = null;
       _focusedDivision = null;
+      _focusedPosition = null;
       _areaLookupRevision++;
       _editorRevision++;
       if (lookupAdmin) {
@@ -377,14 +645,17 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   void _selectWaypoint(Waypoint waypoint) {
     setState(() {
       _selectedWaypointId = waypoint.id;
+      _focusedPosition = null;
       _areaLookupRevision++;
     });
+    _refreshAreaBoundary();
   }
 
   void _clearSelectedWaypoint() {
     setState(() {
       _selectedWaypointId = null;
     });
+    _refreshAreaBoundary();
   }
 
   Future<void> _focusAreaAt(LatLng position) async {
@@ -393,6 +664,7 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
     setState(() {
       _selectedWaypointId = null;
       _focusedDivision = null;
+      _focusedPosition = position;
     });
 
     final division = await _lookupAdminDivision(position);
@@ -403,6 +675,96 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
     setState(() {
       _focusedDivision = division;
     });
+    _refreshAreaBoundary();
+  }
+
+  void _refreshAreaBoundary() {
+    final areaName = _activeAreaName;
+    if (areaName == 'No area data') {
+      setState(() {
+        _activeBoundaryPolygons = const [];
+        _loadedBoundaryKey = '';
+      });
+      return;
+    }
+
+    final key = _activeBoundaryKey;
+    final cached = _boundaryCache[key];
+    if (cached != null) {
+      setState(() {
+        _activeBoundaryPolygons = cached;
+        _loadedBoundaryKey = key;
+      });
+      return;
+    }
+
+    if (_loadedBoundaryKey == key && _activeBoundaryPolygons.isNotEmpty) {
+      return;
+    }
+
+    final lookupId = ++_boundaryLookupRevision;
+    final representativePosition = _activeAreaRepresentativePosition;
+    if (_loadedBoundaryKey != key && _activeBoundaryPolygons.isNotEmpty) {
+      setState(() {
+        _activeBoundaryPolygons = const [];
+        _loadedBoundaryKey = key;
+      });
+    }
+
+    _lookupAdminBoundary(
+      scope: _visitScope,
+      areaName: areaName,
+      near: representativePosition,
+    ).then((boundary) {
+      if (!mounted || lookupId != _boundaryLookupRevision) {
+        return;
+      }
+
+      final polygons = boundary?.polygons ?? const <List<LatLng>>[];
+      if (polygons.isNotEmpty) {
+        _boundaryCache[key] = polygons;
+      }
+
+      setState(() {
+        _activeBoundaryPolygons = polygons;
+        _loadedBoundaryKey = key;
+      });
+    });
+  }
+
+  List<LatLng> _areaShapeAround(List<LatLng> positions) {
+    final latitudes = positions.map((position) => position.latitude);
+    final longitudes = positions.map((position) => position.longitude);
+    final minLat = latitudes.reduce(math.min);
+    final maxLat = latitudes.reduce(math.max);
+    final minLon = longitudes.reduce(math.min);
+    final maxLon = longitudes.reduce(math.max);
+    final center = LatLng((minLat + maxLat) / 2, (minLon + maxLon) / 2);
+    final paddingMeters = switch (_visitScope) {
+      VisitScope.province => positions.length == 1 ? 18000.0 : 8500.0,
+      VisitScope.county => positions.length == 1 ? 8500.0 : 4200.0,
+      VisitScope.municipality => positions.length == 1 ? 3600.0 : 1800.0,
+    };
+    final latPadding = paddingMeters / 111320;
+    final lonScale = math.cos(center.latitude * math.pi / 180).abs();
+    final lonPadding = paddingMeters / (111320 * math.max(lonScale, 0.2));
+
+    final west = minLon - lonPadding;
+    final east = maxLon + lonPadding;
+    final north = maxLat + latPadding;
+    final south = minLat - latPadding;
+    final midLat = center.latitude;
+    final midLon = center.longitude;
+
+    return [
+      LatLng(north, midLon - (midLon - west) * 0.35),
+      LatLng(north - (north - midLat) * 0.18, east),
+      LatLng(midLat + (north - midLat) * 0.10, east - (east - midLon) * 0.08),
+      LatLng(south + (midLat - south) * 0.22, east - (east - midLon) * 0.18),
+      LatLng(south, midLon + (east - midLon) * 0.22),
+      LatLng(south + (midLat - south) * 0.16, west),
+      LatLng(midLat + (north - midLat) * 0.18, west + (midLon - west) * 0.06),
+    ];
   }
 
   void _closeEditor() {
@@ -471,6 +833,7 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       _selectedWaypointId = savedId;
       _editorRevision++;
     });
+    _refreshAreaBoundary();
 
     if (shouldLookupAdmin) {
       _enrichWaypointAdminData(savedId, position);
@@ -504,12 +867,14 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
         city: division.city,
       );
     });
+    _refreshAreaBoundary();
   }
 
   void _setVisitScope(VisitScope scope) {
     setState(() {
       _visitScope = scope;
     });
+    _refreshAreaBoundary();
   }
 
   void _deleteWaypoint(Waypoint waypoint) {
@@ -524,10 +889,13 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
         _editorRevision++;
       }
     });
+    _refreshAreaBoundary();
   }
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
     return Scaffold(
       body: Stack(
         children: [
@@ -542,6 +910,18 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
                 urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.pietrusiewicz.stadiumly',
               ),
+              if (_activeAreaShapes.isNotEmpty)
+                PolygonLayer(
+                  polygons: [
+                    for (final polygon in _activeAreaShapes)
+                      Polygon(
+                        points: polygon,
+                        color: colors.primary.withValues(alpha: 0.14),
+                        borderColor: colors.primary.withValues(alpha: 0.76),
+                        borderStrokeWidth: 3,
+                      ),
+                  ],
+                ),
               MarkerLayer(
                 markers: [
                   for (final waypoint in _waypoints)
