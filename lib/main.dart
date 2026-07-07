@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -89,6 +90,37 @@ class AdminDivision {
   final String county;
   final String municipality;
   final String city;
+}
+
+double _distanceBetweenMeters(LatLng from, LatLng to) {
+  const earthRadiusMeters = 6371000.0;
+  final fromLat = from.latitude * math.pi / 180;
+  final toLat = to.latitude * math.pi / 180;
+  final latDelta = (to.latitude - from.latitude) * math.pi / 180;
+  final lonDelta = (to.longitude - from.longitude) * math.pi / 180;
+
+  final a =
+      math.sin(latDelta / 2) * math.sin(latDelta / 2) +
+      math.cos(fromLat) *
+          math.cos(toLat) *
+          math.sin(lonDelta / 2) *
+          math.sin(lonDelta / 2);
+  final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+
+  return earthRadiusMeters * c;
+}
+
+String _formatDistance(double meters) {
+  if (meters < 1000) {
+    return '${meters.round()} m';
+  }
+
+  final kilometers = meters / 1000;
+  if (kilometers < 10) {
+    return '${kilometers.toStringAsFixed(1)} km';
+  }
+
+  return '${kilometers.round()} km';
 }
 
 Future<AdminDivision?> _lookupAdminDivision(LatLng position) async {
@@ -185,9 +217,19 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       municipality: 'Warszawa',
       city: 'Warszawa',
     ),
+    const Waypoint(
+      id: 4,
+      name: 'Gdansk waterfront gate',
+      category: 'Away trip',
+      position: LatLng(54.3520, 18.6466),
+      province: 'Pomorskie',
+      county: 'Gdansk',
+      municipality: 'Gdansk',
+      city: 'Gdansk',
+    ),
   ];
 
-  int _nextWaypointId = 4;
+  int _nextWaypointId = 5;
   VisitScope _visitScope = VisitScope.province;
 
   String _scopeValue(Waypoint waypoint) {
@@ -195,6 +237,14 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       VisitScope.province => waypoint.province.trim(),
       VisitScope.county => waypoint.county.trim(),
       VisitScope.municipality => waypoint.municipality.trim(),
+    };
+  }
+
+  String _scopeDivisionValue(AdminDivision division) {
+    return switch (_visitScope) {
+      VisitScope.province => division.province.trim(),
+      VisitScope.county => division.county.trim(),
+      VisitScope.municipality => division.municipality.trim(),
     };
   }
 
@@ -207,6 +257,21 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   }
 
   String get _activeAreaName {
+    final selectedAreaName = _selectedWaypoint == null
+        ? ''
+        : _scopeValue(_selectedWaypoint!);
+    if (selectedAreaName.isNotEmpty) {
+      return selectedAreaName;
+    }
+
+    final focusedDivision = _focusedDivision;
+    if (focusedDivision != null) {
+      final focusedAreaName = _scopeDivisionValue(focusedDivision);
+      if (focusedAreaName.isNotEmpty) {
+        return focusedAreaName;
+      }
+    }
+
     for (final waypoint in _waypoints) {
       final value = _scopeValue(waypoint);
       if (value.isNotEmpty) {
@@ -237,6 +302,24 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   int _adminLookupRevision = 0;
   bool _adminMode = false;
   bool _editorOpen = false;
+  int? _selectedWaypointId;
+  AdminDivision? _focusedDivision;
+  int _areaLookupRevision = 0;
+
+  Waypoint? get _selectedWaypoint {
+    final id = _selectedWaypointId;
+    if (id == null) {
+      return null;
+    }
+
+    for (final waypoint in _waypoints) {
+      if (waypoint.id == id) {
+        return waypoint;
+      }
+    }
+
+    return null;
+  }
 
   void _startCreateAt(
     TapPosition _,
@@ -244,6 +327,7 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
     bool lookupAdmin = true,
   }) {
     if (!_adminMode) {
+      _focusAreaAt(position);
       return;
     }
 
@@ -251,6 +335,9 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       _editingWaypoint = null;
       _draftPosition = position;
       _editorOpen = true;
+      _selectedWaypointId = null;
+      _focusedDivision = null;
+      _areaLookupRevision++;
       _editorRevision++;
       if (lookupAdmin) {
         _adminLookupRevision++;
@@ -282,7 +369,39 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       _editingWaypoint = waypoint;
       _draftPosition = waypoint.position;
       _editorOpen = true;
+      _selectedWaypointId = waypoint.id;
       _editorRevision++;
+    });
+  }
+
+  void _selectWaypoint(Waypoint waypoint) {
+    setState(() {
+      _selectedWaypointId = waypoint.id;
+      _areaLookupRevision++;
+    });
+  }
+
+  void _clearSelectedWaypoint() {
+    setState(() {
+      _selectedWaypointId = null;
+    });
+  }
+
+  Future<void> _focusAreaAt(LatLng position) async {
+    final lookupId = ++_areaLookupRevision;
+
+    setState(() {
+      _selectedWaypointId = null;
+      _focusedDivision = null;
+    });
+
+    final division = await _lookupAdminDivision(position);
+    if (!mounted || lookupId != _areaLookupRevision) {
+      return;
+    }
+
+    setState(() {
+      _focusedDivision = division;
     });
   }
 
@@ -349,6 +468,7 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       _editingWaypoint = null;
       _draftPosition = position;
       _editorOpen = false;
+      _selectedWaypointId = savedId;
       _editorRevision++;
     });
 
@@ -386,17 +506,6 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
     });
   }
 
-  void _toggleVisited(Waypoint waypoint) {
-    setState(() {
-      final index = _waypoints.indexWhere((item) => item.id == waypoint.id);
-      if (index == -1) {
-        return;
-      }
-
-      _waypoints[index] = waypoint.copyWith(visited: !waypoint.visited);
-    });
-  }
-
   void _setVisitScope(VisitScope scope) {
     setState(() {
       _visitScope = scope;
@@ -406,6 +515,9 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   void _deleteWaypoint(Waypoint waypoint) {
     setState(() {
       _waypoints.removeWhere((item) => item.id == waypoint.id);
+      if (_selectedWaypointId == waypoint.id) {
+        _selectedWaypointId = null;
+      }
       if (_editingWaypoint?.id == waypoint.id) {
         _editingWaypoint = null;
         _editorOpen = false;
@@ -439,7 +551,8 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
                       height: 54,
                       child: _WaypointMarker(
                         waypoint: waypoint,
-                        onPressed: () => _toggleVisited(waypoint),
+                        selected: _selectedWaypointId == waypoint.id,
+                        onPressed: () => _selectWaypoint(waypoint),
                       ),
                     ),
                   if (_adminMode && _editorOpen)
@@ -458,12 +571,14 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
               padding: const EdgeInsets.all(16),
               child: _TripSummary(
                 areaName: _activeAreaName,
+                selectedWaypoint: _selectedWaypoint,
                 scopeLabel: _scopeLabel,
                 scope: _visitScope,
                 visitedCount: _areaVisitedCount,
                 totalCount: _areaTotalCount,
                 progress: _progress,
                 onScopeChanged: _setVisitScope,
+                onClearSelection: _clearSelectedWaypoint,
               ),
             ),
           ),
@@ -473,9 +588,11 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
               minimum: const EdgeInsets.fromLTRB(12, 0, 12, 12),
               child: _WaypointPanel(
                 waypoints: _waypoints,
+                distanceOrigin: _initialCenter,
                 adminMode: _adminMode,
                 editorOpen: _editorOpen,
                 editingWaypoint: _editingWaypoint,
+                selectedWaypointId: _selectedWaypointId,
                 draftPosition: _draftPosition,
                 editorRevision: _editorRevision,
                 adminLookupRevision: _adminLookupRevision,
@@ -484,7 +601,7 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
                 onCloseEditor: _closeEditor,
                 onEdit: _editWaypoint,
                 onSave: _saveWaypoint,
-                onToggleVisited: _toggleVisited,
+                onSelect: _selectWaypoint,
                 onDelete: _deleteWaypoint,
               ),
             ),
@@ -498,25 +615,39 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
 class _TripSummary extends StatelessWidget {
   const _TripSummary({
     required this.areaName,
+    required this.selectedWaypoint,
     required this.scopeLabel,
     required this.scope,
     required this.visitedCount,
     required this.totalCount,
     required this.progress,
     required this.onScopeChanged,
+    required this.onClearSelection,
   });
 
   final String areaName;
+  final Waypoint? selectedWaypoint;
   final String scopeLabel;
   final VisitScope scope;
   final int visitedCount;
   final int totalCount;
   final double progress;
   final ValueChanged<VisitScope> onScopeChanged;
+  final VoidCallback onClearSelection;
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
+    final waypoint = selectedWaypoint;
+    final title = waypoint?.name ?? areaName;
+    final subtitle = waypoint == null
+        ? 'Visited in $scopeLabel'
+        : '${waypoint.category} - ${waypoint.visited ? 'visited' : 'not visited'}';
+    final detail = waypoint == null
+        ? null
+        : '$areaName - '
+              '${waypoint.position.latitude.toStringAsFixed(4)}, '
+              '${waypoint.position.longitude.toStringAsFixed(4)}';
 
     return Material(
       elevation: 6,
@@ -531,14 +662,33 @@ class _TripSummary extends StatelessWidget {
             Row(
               children: [
                 Container(
-                  width: 42,
-                  height: 42,
+                  width: 52,
+                  height: 52,
                   decoration: BoxDecoration(
                     color: colors.primaryContainer,
                     borderRadius: BorderRadius.circular(8),
+                    boxShadow: [
+                      BoxShadow(
+                        color: colors.shadow.withValues(alpha: 0.12),
+                        blurRadius: 12,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
                   ),
-                  padding: const EdgeInsets.all(7),
-                  child: _AreaShapeIcon(scope: scope, areaName: areaName),
+                  padding: const EdgeInsets.all(5),
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 180),
+                    child: waypoint == null
+                        ? _AreaShapeIcon(
+                            key: ValueKey('area-shape-$scope-$areaName'),
+                            scope: scope,
+                            areaName: areaName,
+                          )
+                        : _ObjectShapeIcon(
+                            key: ValueKey('object-shape-${waypoint.id}'),
+                            waypoint: waypoint,
+                          ),
+                  ),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -546,7 +696,7 @@ class _TripSummary extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        areaName,
+                        title,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -554,56 +704,89 @@ class _TripSummary extends StatelessWidget {
                           fontWeight: FontWeight.w800,
                         ),
                       ),
-                      Text('Visited in $scopeLabel'),
+                      Text(
+                        subtitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      if (detail != null)
+                        Text(
+                          detail,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: colors.onSurfaceVariant,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
                     ],
                   ),
                 ),
-                Text(
-                  '$visitedCount/$totalCount',
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w800,
+                if (waypoint == null)
+                  Text(
+                    '$visitedCount/$totalCount',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800,
+                    ),
                   ),
-                ),
+                if (waypoint != null) ...[
+                  const SizedBox(width: 4),
+                  IconButton(
+                    tooltip: 'Clear selected object',
+                    onPressed: onClearSelection,
+                    constraints: const BoxConstraints.tightFor(
+                      width: 34,
+                      height: 34,
+                    ),
+                    padding: EdgeInsets.zero,
+                    icon: const Icon(Icons.close, size: 20),
+                  ),
+                ],
               ],
             ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: SegmentedButton<VisitScope>(
-                    segments: const [
-                      ButtonSegment(
-                        value: VisitScope.province,
-                        label: Text('Woj'),
-                      ),
-                      ButtonSegment(
-                        value: VisitScope.county,
-                        label: Text('Powiat'),
-                      ),
-                      ButtonSegment(
-                        value: VisitScope.municipality,
-                        label: Text('Gmina'),
-                      ),
-                    ],
-                    selected: {scope},
-                    showSelectedIcon: false,
-                    onSelectionChanged: (selection) {
-                      onScopeChanged(selection.single);
-                    },
+            if (waypoint == null) ...[
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: SegmentedButton<VisitScope>(
+                      segments: const [
+                        ButtonSegment(
+                          value: VisitScope.province,
+                          label: Text('Woj'),
+                        ),
+                        ButtonSegment(
+                          value: VisitScope.county,
+                          label: Text('Powiat'),
+                        ),
+                        ButtonSegment(
+                          value: VisitScope.municipality,
+                          label: Text('Gmina'),
+                        ),
+                      ],
+                      selected: {scope},
+                      showSelectedIcon: false,
+                      onSelectionChanged: (selection) {
+                        onScopeChanged(selection.single);
+                      },
+                    ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(999),
-              child: LinearProgressIndicator(
-                minHeight: 8,
-                value: progress,
-                backgroundColor: colors.surfaceContainerHighest,
+                ],
               ),
-            ),
+            ],
+            if (waypoint == null) ...[
+              const SizedBox(height: 12),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(999),
+                child: LinearProgressIndicator(
+                  minHeight: 8,
+                  value: progress,
+                  backgroundColor: colors.surfaceContainerHighest,
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -611,8 +794,136 @@ class _TripSummary extends StatelessWidget {
   }
 }
 
+class _ObjectShapeIcon extends StatelessWidget {
+  const _ObjectShapeIcon({super.key, required this.waypoint});
+
+  final Waypoint waypoint;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final fillColor = waypoint.visited
+        ? colors.primary
+        : Colors.deepOrangeAccent;
+
+    return SizedBox.expand(
+      child: CustomPaint(
+        painter: _ObjectShapePainter(
+          fillColor: fillColor,
+          strokeColor: colors.onPrimaryContainer,
+          visited: waypoint.visited,
+        ),
+      ),
+    );
+  }
+}
+
+class _ObjectShapePainter extends CustomPainter {
+  const _ObjectShapePainter({
+    required this.fillColor,
+    required this.strokeColor,
+    required this.visited,
+  });
+
+  final Color fillColor;
+  final Color strokeColor;
+  final bool visited;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    Offset at(double dx, double dy) =>
+        Offset(dx * size.width, dy * size.height);
+
+    final shape = ui.Path()
+      ..moveTo(at(0.50, 0.04).dx, at(0.50, 0.04).dy)
+      ..cubicTo(
+        at(0.77, 0.05).dx,
+        at(0.77, 0.05).dy,
+        at(0.88, 0.48).dx,
+        at(0.88, 0.48).dy,
+        at(0.72, 0.70).dx,
+        at(0.72, 0.70).dy,
+      )
+      ..lineTo(at(0.50, 0.95).dx, at(0.50, 0.95).dy)
+      ..lineTo(at(0.28, 0.70).dx, at(0.28, 0.70).dy)
+      ..cubicTo(
+        at(0.12, 0.48).dx,
+        at(0.12, 0.48).dy,
+        at(0.06, 0.23).dx,
+        at(0.06, 0.23).dy,
+        at(0.50, 0.04).dx,
+        at(0.50, 0.04).dy,
+      )
+      ..close();
+
+    canvas.drawPath(
+      shape.shift(const Offset(0, 1)),
+      Paint()
+        ..color = Colors.black.withValues(alpha: 0.16)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawPath(
+      shape,
+      Paint()
+        ..shader =
+            ui.Gradient.linear(Offset.zero, Offset(size.width, size.height), [
+              fillColor.withValues(alpha: 0.98),
+              Color.lerp(fillColor, Colors.black, 0.24)!,
+            ])
+        ..style = PaintingStyle.fill,
+    );
+
+    final ring = Rect.fromCenter(
+      center: at(0.50, 0.39),
+      width: size.width * 0.45,
+      height: size.height * 0.29,
+    );
+    final ringPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.9)
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+    canvas.drawOval(ring, ringPaint);
+    canvas.drawOval(ring.deflate(size.shortestSide * 0.06), ringPaint);
+
+    if (visited) {
+      final check = ui.Path()
+        ..moveTo(at(0.35, 0.40).dx, at(0.35, 0.40).dy)
+        ..lineTo(at(0.46, 0.51).dx, at(0.46, 0.51).dy)
+        ..lineTo(at(0.67, 0.30).dx, at(0.67, 0.30).dy);
+      canvas.drawPath(
+        check,
+        Paint()
+          ..color = Colors.white
+          ..strokeWidth = 3
+          ..strokeCap = StrokeCap.round
+          ..strokeJoin = StrokeJoin.round
+          ..style = PaintingStyle.stroke,
+      );
+    }
+
+    canvas.drawPath(
+      shape,
+      Paint()
+        ..color = strokeColor.withValues(alpha: 0.58)
+        ..strokeWidth = 1.5
+        ..style = PaintingStyle.stroke,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _ObjectShapePainter oldDelegate) {
+    return oldDelegate.fillColor != fillColor ||
+        oldDelegate.strokeColor != strokeColor ||
+        oldDelegate.visited != visited;
+  }
+}
+
 class _AreaShapeIcon extends StatelessWidget {
-  const _AreaShapeIcon({required this.scope, required this.areaName});
+  const _AreaShapeIcon({
+    super.key,
+    required this.scope,
+    required this.areaName,
+  });
 
   final VisitScope scope;
   final String areaName;
@@ -621,12 +932,14 @@ class _AreaShapeIcon extends StatelessWidget {
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
 
-    return CustomPaint(
-      painter: _AreaShapePainter(
-        scope: scope,
-        areaName: areaName,
-        fillColor: colors.primary,
-        strokeColor: colors.onPrimaryContainer,
+    return SizedBox.expand(
+      child: CustomPaint(
+        painter: _AreaShapePainter(
+          scope: scope,
+          areaName: areaName,
+          fillColor: colors.primary,
+          strokeColor: colors.onPrimaryContainer,
+        ),
       ),
     );
   }
@@ -648,14 +961,7 @@ class _AreaShapePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final shape = _shapeFor(scope, areaName);
-    final path = ui.Path()
-      ..moveTo(shape.first.dx * size.width, shape.first.dy * size.height);
-
-    for (final point in shape.skip(1)) {
-      path.lineTo(point.dx * size.width, point.dy * size.height);
-    }
-
-    path.close();
+    final path = _smoothedPath(shape, size);
 
     final shadowPath = path.shift(const Offset(0, 1));
     canvas.drawPath(
@@ -667,16 +973,134 @@ class _AreaShapePainter extends CustomPainter {
     canvas.drawPath(
       path,
       Paint()
-        ..color = fillColor
+        ..shader =
+            ui.Gradient.linear(Offset.zero, Offset(size.width, size.height), [
+              fillColor.withValues(alpha: 0.98),
+              Color.lerp(fillColor, Colors.black, 0.18)!,
+            ])
         ..style = PaintingStyle.fill,
     );
+
+    canvas.save();
+    canvas.clipPath(path);
+    _drawMapDetails(canvas, size);
+    canvas.restore();
+
     canvas.drawPath(
       path,
       Paint()
         ..color = strokeColor.withValues(alpha: 0.58)
-        ..strokeWidth = 1.4
+        ..strokeWidth = 1.6
         ..style = PaintingStyle.stroke
         ..strokeJoin = StrokeJoin.round,
+    );
+  }
+
+  ui.Path _smoothedPath(List<Offset> shape, Size size) {
+    Offset scaled(Offset point) {
+      return Offset(point.dx * size.width, point.dy * size.height);
+    }
+
+    final points = shape.map(scaled).toList();
+    final path = ui.Path();
+    final first = Offset.lerp(points.last, points.first, 0.5)!;
+    path.moveTo(first.dx, first.dy);
+
+    for (var index = 0; index < points.length; index++) {
+      final current = points[index];
+      final next = points[(index + 1) % points.length];
+      final midpoint = Offset.lerp(current, next, 0.5)!;
+      path.quadraticBezierTo(current.dx, current.dy, midpoint.dx, midpoint.dy);
+    }
+
+    path.close();
+    return path;
+  }
+
+  void _drawMapDetails(Canvas canvas, Size size) {
+    Offset at(double dx, double dy) =>
+        Offset(dx * size.width, dy * size.height);
+
+    final boundaryPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.18)
+      ..strokeWidth = 1
+      ..style = PaintingStyle.stroke;
+
+    switch (scope) {
+      case VisitScope.province:
+        canvas.drawLine(at(0.18, 0.40), at(0.84, 0.56), boundaryPaint);
+        canvas.drawLine(at(0.43, 0.12), at(0.35, 0.89), boundaryPaint);
+        canvas.drawLine(at(0.23, 0.73), at(0.76, 0.31), boundaryPaint);
+      case VisitScope.county:
+        canvas.drawLine(at(0.22, 0.31), at(0.80, 0.31), boundaryPaint);
+        canvas.drawLine(at(0.20, 0.55), at(0.82, 0.55), boundaryPaint);
+        canvas.drawLine(at(0.40, 0.16), at(0.40, 0.83), boundaryPaint);
+        canvas.drawLine(at(0.63, 0.19), at(0.58, 0.86), boundaryPaint);
+      case VisitScope.municipality:
+        canvas.drawLine(at(0.25, 0.44), at(0.75, 0.38), boundaryPaint);
+        canvas.drawLine(at(0.35, 0.22), at(0.61, 0.80), boundaryPaint);
+    }
+
+    final routePaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.42)
+      ..strokeWidth = switch (scope) {
+        VisitScope.province => 1.45,
+        VisitScope.county => 1.3,
+        VisitScope.municipality => 1.15,
+      }
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+    final route = ui.Path()
+      ..moveTo(at(0.19, 0.67).dx, at(0.19, 0.67).dy)
+      ..cubicTo(
+        at(0.35, 0.53).dx,
+        at(0.35, 0.53).dy,
+        at(0.43, 0.77).dx,
+        at(0.43, 0.77).dy,
+        at(0.58, 0.60).dx,
+        at(0.58, 0.60).dy,
+      )
+      ..cubicTo(
+        at(0.70, 0.47).dx,
+        at(0.70, 0.47).dy,
+        at(0.60, 0.29).dx,
+        at(0.60, 0.29).dy,
+        at(0.80, 0.22).dx,
+        at(0.80, 0.22).dy,
+      );
+    canvas.drawPath(route, routePaint);
+
+    final glowPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.22)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
+    canvas.drawCircle(at(0.58, 0.60), size.shortestSide * 0.12, glowPaint);
+
+    final dotPaint = Paint()
+      ..color = Colors.white
+      ..style = PaintingStyle.fill;
+    final points = switch (scope) {
+      VisitScope.province => [at(0.19, 0.67), at(0.58, 0.60), at(0.80, 0.22)],
+      VisitScope.county => [at(0.28, 0.34), at(0.58, 0.60), at(0.72, 0.42)],
+      VisitScope.municipality => [at(0.58, 0.60)],
+    };
+    for (final point in points) {
+      canvas.drawCircle(point, size.shortestSide * 0.035, dotPaint);
+    }
+
+    final stadiumCenter = at(0.60, 0.60);
+    final stadiumRect = Rect.fromCenter(
+      center: stadiumCenter,
+      width: size.width * 0.29,
+      height: size.height * 0.19,
+    );
+    final stadiumPaint = Paint()
+      ..color = strokeColor.withValues(alpha: 0.86)
+      ..strokeWidth = 1.35
+      ..style = PaintingStyle.stroke;
+    canvas.drawOval(stadiumRect, stadiumPaint);
+    canvas.drawOval(
+      stadiumRect.deflate(size.shortestSide * 0.045),
+      stadiumPaint,
     );
   }
 
@@ -768,9 +1192,14 @@ class _AreaShapePainter extends CustomPainter {
 }
 
 class _WaypointMarker extends StatelessWidget {
-  const _WaypointMarker({required this.waypoint, required this.onPressed});
+  const _WaypointMarker({
+    required this.waypoint,
+    required this.selected,
+    required this.onPressed,
+  });
 
   final Waypoint waypoint;
+  final bool selected;
   final VoidCallback onPressed;
 
   @override
@@ -790,14 +1219,15 @@ class _WaypointMarker extends StatelessWidget {
             boxShadow: [
               BoxShadow(
                 color: Colors.black.withValues(alpha: 0.22),
-                blurRadius: 10,
-                offset: const Offset(0, 4),
+                blurRadius: selected ? 14 : 10,
+                offset: Offset(0, selected ? 6 : 4),
               ),
             ],
           ),
-          padding: const EdgeInsets.all(5),
+          padding: EdgeInsets.all(selected ? 3 : 5),
           child: CircleAvatar(
             backgroundColor: color,
+            radius: selected ? 23 : null,
             child: Icon(
               waypoint.visited ? Icons.check : Icons.place,
               color: Colors.white,
@@ -857,9 +1287,11 @@ typedef _WaypointSave =
 class _WaypointPanel extends StatefulWidget {
   const _WaypointPanel({
     required this.waypoints,
+    required this.distanceOrigin,
     required this.adminMode,
     required this.editorOpen,
     required this.editingWaypoint,
+    required this.selectedWaypointId,
     required this.draftPosition,
     required this.editorRevision,
     required this.adminLookupRevision,
@@ -868,14 +1300,16 @@ class _WaypointPanel extends StatefulWidget {
     required this.onCloseEditor,
     required this.onEdit,
     required this.onSave,
-    required this.onToggleVisited,
+    required this.onSelect,
     required this.onDelete,
   });
 
   final List<Waypoint> waypoints;
+  final LatLng distanceOrigin;
   final bool adminMode;
   final bool editorOpen;
   final Waypoint? editingWaypoint;
+  final int? selectedWaypointId;
   final LatLng draftPosition;
   final int editorRevision;
   final int adminLookupRevision;
@@ -884,7 +1318,7 @@ class _WaypointPanel extends StatefulWidget {
   final VoidCallback onCloseEditor;
   final ValueChanged<Waypoint> onEdit;
   final _WaypointSave onSave;
-  final ValueChanged<Waypoint> onToggleVisited;
+  final ValueChanged<Waypoint> onSelect;
   final ValueChanged<Waypoint> onDelete;
 
   @override
@@ -1274,9 +1708,11 @@ class _WaypointPanelState extends State<_WaypointPanel> {
 
         return _WaypointTile(
           waypoint: waypoint,
+          distanceOrigin: widget.distanceOrigin,
           adminMode: widget.adminMode,
+          selected: widget.selectedWaypointId == waypoint.id,
+          onSelect: () => widget.onSelect(waypoint),
           onEdit: () => widget.onEdit(waypoint),
-          onToggleVisited: () => widget.onToggleVisited(waypoint),
           onDelete: () => widget.onDelete(waypoint),
         );
       },
@@ -1362,48 +1798,55 @@ class _WaypointPanelState extends State<_WaypointPanel> {
 class _WaypointTile extends StatelessWidget {
   const _WaypointTile({
     required this.waypoint,
+    required this.distanceOrigin,
     required this.adminMode,
+    required this.selected,
+    required this.onSelect,
     required this.onEdit,
-    required this.onToggleVisited,
     required this.onDelete,
   });
 
   final Waypoint waypoint;
+  final LatLng distanceOrigin;
   final bool adminMode;
+  final bool selected;
+  final VoidCallback onSelect;
   final VoidCallback onEdit;
-  final VoidCallback onToggleVisited;
   final VoidCallback onDelete;
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final adminSummary = [
-      waypoint.city,
-      waypoint.municipality,
-      waypoint.county,
-      waypoint.province,
-    ].where((value) => value.trim().isNotEmpty).join(' / ');
+    final distanceText = _formatDistance(
+      _distanceBetweenMeters(distanceOrigin, waypoint.position),
+    );
 
     return ListTile(
-      contentPadding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
-      leading: Checkbox(
-        value: waypoint.visited,
-        onChanged: (_) => onToggleVisited(),
-      ),
-      title: Text(
-        waypoint.name,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: TextStyle(
-          fontWeight: FontWeight.w700,
-          decoration: waypoint.visited ? TextDecoration.lineThrough : null,
-        ),
-      ),
-      subtitle: Text(
-        '${waypoint.category} - '
-        '${waypoint.position.latitude.toStringAsFixed(4)}, '
-        '${waypoint.position.longitude.toStringAsFixed(4)}'
-        '${adminSummary.isEmpty ? '' : '\n$adminSummary'}',
+      selected: selected,
+      selectedTileColor: colors.primaryContainer.withValues(alpha: 0.36),
+      contentPadding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
+      onTap: onSelect,
+      minLeadingWidth: 0,
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(
+              waypoint.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Text(
+            distanceText,
+            style: TextStyle(
+              color: colors.onSurfaceVariant,
+              fontSize: 13,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
       ),
       trailing: adminMode
           ? Row(

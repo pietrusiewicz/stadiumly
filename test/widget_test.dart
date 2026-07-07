@@ -15,6 +15,8 @@ void main() {
     expect(find.text('Gmina'), findsOneWidget);
     expect(find.text('Waypoints'), findsOneWidget);
     expect(find.text('National Stadium'), findsOneWidget);
+    expect(find.text('2.5 km'), findsOneWidget);
+    expect(find.text('Match day - 52.2394, 21.0458'), findsNothing);
     expect(find.text('1/3'), findsOneWidget);
     expect(find.text('User'), findsOneWidget);
     expect(find.text('Admin'), findsOneWidget);
@@ -37,6 +39,46 @@ void main() {
 
     expect(find.text('Visited in Gmina'), findsOneWidget);
     expect(find.text('1/3'), findsOneWidget);
+  });
+
+  testWidgets('updates the header after selecting an object', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const StadiumlyApp());
+
+    await tester.tap(find.text('National Stadium'));
+    await tester.pump();
+
+    expect(find.text('National Stadium'), findsWidgets);
+    expect(find.text('Match day - visited'), findsOneWidget);
+    expect(find.text('Mazowieckie - 52.2394, 21.0458'), findsOneWidget);
+    expect(find.text('1/3'), findsNothing);
+    expect(find.text('Woj'), findsNothing);
+    expect(find.text('Powiat'), findsNothing);
+    expect(find.text('Gmina'), findsNothing);
+    expect(find.byTooltip('Clear selected object'), findsOneWidget);
+
+    await tester.scrollUntilVisible(
+      find.text('Gdansk waterfront gate'),
+      120,
+      scrollable: find.byType(Scrollable).last,
+    );
+    await tester.tap(find.text('Gdansk waterfront gate'));
+    await tester.pump();
+
+    expect(find.text('Gdansk waterfront gate'), findsWidgets);
+    expect(find.text('Away trip - not visited'), findsOneWidget);
+    expect(find.text('Pomorskie - 54.3520, 18.6466'), findsOneWidget);
+    expect(find.text('0/1'), findsNothing);
+
+    await tester.tap(find.byTooltip('Clear selected object'));
+    await tester.pump();
+
+    expect(find.text('Mazowieckie'), findsOneWidget);
+    expect(find.text('1/3'), findsOneWidget);
+    expect(find.text('Woj'), findsOneWidget);
+    expect(find.text('Powiat'), findsOneWidget);
+    expect(find.text('Gmina'), findsOneWidget);
   });
 
   testWidgets('creates an object from manual coordinates', (
@@ -78,7 +120,7 @@ void main() {
     await tester.tap(find.text('Create'));
     await tester.pump();
 
-    expect(find.text('4 objects'), findsOneWidget);
+    expect(find.text('5 objects'), findsOneWidget);
     await tester.scrollUntilVisible(
       find.text('Manual Gate'),
       120,
