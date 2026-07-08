@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 
@@ -185,7 +186,7 @@ Future<AdminBoundary?> _lookupAdminBoundary({
   LatLng? near,
 }) async {
   final query = switch (scope) {
-    VisitScope.province => '$areaName wojewodztwo Polska',
+    VisitScope.province => '$areaName województwo Polska',
     VisitScope.county => '$areaName powiat Polska',
     VisitScope.municipality => '$areaName gmina Polska',
   };
@@ -193,8 +194,10 @@ Future<AdminBoundary?> _lookupAdminBoundary({
     'format': 'jsonv2',
     'q': query,
     'addressdetails': '1',
+    'extratags': '1',
+    'dedupe': '1',
     'polygon_geojson': '1',
-    'limit': '8',
+    'limit': '12',
     'countrycodes': 'pl',
     'accept-language': 'pl',
   });
@@ -255,8 +258,9 @@ double _boundaryCandidateScore(
   var score = 0.0;
   final itemClass = (item['class'] as String?)?.toLowerCase() ?? '';
   final type = (item['type'] as String?)?.toLowerCase() ?? '';
-  final displayName = (item['display_name'] as String?)?.toLowerCase() ?? '';
-  final normalizedArea = areaName.toLowerCase();
+  final osmType = (item['osm_type'] as String?)?.toLowerCase() ?? '';
+  final displayName = _normalizeAdminName(item['display_name'] as String?);
+  final normalizedArea = _normalizeAdminName(areaName);
 
   if (itemClass == 'boundary') {
     score += 20;
@@ -264,19 +268,32 @@ double _boundaryCandidateScore(
   if (type == 'administrative') {
     score += 20;
   }
+  if (osmType == 'relation') {
+    score += 14;
+  }
   if (displayName.contains(normalizedArea)) {
     score += 12;
+  }
+
+  final adminLevel = _adminLevelOf(item);
+  final expectedAdminLevel = _expectedAdminLevel(scope);
+  if (adminLevel == expectedAdminLevel) {
+    score += 34;
+  } else if (adminLevel != null) {
+    score -= (adminLevel - expectedAdminLevel).abs() * 8;
   }
 
   final address = item['address'];
   if (address is Map<String, dynamic>) {
     final scopedAddress = switch (scope) {
       VisitScope.province => address['state'],
-      VisitScope.county => address['county'],
-      VisitScope.municipality => address['municipality'] ?? address['city'],
+      VisitScope.county => address['county'] ?? address['city'],
+      VisitScope.municipality =>
+        address['municipality'] ?? address['city'] ?? address['town'],
     };
-    if ((scopedAddress as String?)?.toLowerCase().contains(normalizedArea) ??
-        false) {
+    if (_normalizeAdminName(
+      scopedAddress as String?,
+    ).contains(normalizedArea)) {
       score += 30;
     }
   }
@@ -296,6 +313,63 @@ double _boundaryCandidateScore(
   return score;
 }
 
+int _expectedAdminLevel(VisitScope scope) {
+  return switch (scope) {
+    VisitScope.province => 4,
+    VisitScope.county => 6,
+    VisitScope.municipality => 7,
+  };
+}
+
+int? _adminLevelOf(Map<String, dynamic> item) {
+  final directLevel = int.tryParse((item['admin_level'] as String?) ?? '');
+  if (directLevel != null) {
+    return directLevel;
+  }
+
+  final extratags = item['extratags'];
+  if (extratags is! Map<String, dynamic>) {
+    return null;
+  }
+
+  return int.tryParse((extratags['admin_level'] as String?) ?? '');
+}
+
+String _normalizeAdminName(String? value) {
+  return (value ?? '')
+      .toLowerCase()
+      .replaceAll('ą', 'a')
+      .replaceAll('ć', 'c')
+      .replaceAll('ę', 'e')
+      .replaceAll('ł', 'l')
+      .replaceAll('ń', 'n')
+      .replaceAll('ó', 'o')
+      .replaceAll('ś', 's')
+      .replaceAll('ż', 'z')
+      .replaceAll('ź', 'z');
+}
+
+String _normalizeLocalBoundaryName(VisitScope scope, String value) {
+  var normalized = _normalizeAdminName(
+    value,
+  ).replaceAll(RegExp(r'[^a-z0-9]+'), ' ').trim();
+
+  final administrativeWords = switch (scope) {
+    VisitScope.province => const ['wojewodztwo', 'woj'],
+    VisitScope.county => const ['powiat', 'pow'],
+    VisitScope.municipality => const ['gmina', 'gm'],
+  };
+
+  for (final word in administrativeWords) {
+    normalized = normalized
+        .replaceAll(RegExp('^$word '), '')
+        .replaceAll(RegExp(' $word\$'), '')
+        .trim();
+  }
+
+  return normalized.replaceAll(RegExp(r'\s+'), ' ');
+}
+
 double _polygonWeight(List<List<LatLng>> polygons) {
   final points = polygons.fold<int>(
     0,
@@ -310,6 +384,22 @@ List<List<LatLng>> _polygonsFromGeoJson(Object? geojson) {
   }
 
   final type = geojson['type'];
+  if (type == 'Feature') {
+    return _polygonsFromGeoJson(geojson['geometry']);
+  }
+  if (type == 'FeatureCollection') {
+    final features = geojson['features'];
+    if (features is! List) {
+      return const [];
+    }
+
+    final polygons = <List<LatLng>>[];
+    for (final feature in features) {
+      polygons.addAll(_polygonsFromGeoJson(feature));
+    }
+    return polygons;
+  }
+
   final coordinates = geojson['coordinates'];
   if (type == 'Polygon') {
     final polygon = _polygonOuterRing(coordinates);
@@ -382,6 +472,8 @@ class WaypointMapScreen extends StatefulWidget {
 
 class _WaypointMapScreenState extends State<WaypointMapScreen> {
   static const _initialCenter = LatLng(52.2297, 21.0122);
+  static const _localAdminBoundariesAsset =
+      'assets/admin_boundaries/wojewodztwa_poc.geojson';
 
   final List<Waypoint> _waypoints = [
     const Waypoint(
@@ -430,16 +522,18 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   int _nextWaypointId = 5;
   VisitScope _visitScope = VisitScope.province;
 
-  String _scopeValue(Waypoint waypoint) {
-    return switch (_visitScope) {
+  VisitScope get _activeAreaScope => _visitScope;
+
+  String _scopeValue(Waypoint waypoint, {VisitScope? scope}) {
+    return switch (scope ?? _visitScope) {
       VisitScope.province => waypoint.province.trim(),
       VisitScope.county => waypoint.county.trim(),
       VisitScope.municipality => waypoint.municipality.trim(),
     };
   }
 
-  String _scopeDivisionValue(AdminDivision division) {
-    return switch (_visitScope) {
+  String _scopeDivisionValue(AdminDivision division, {VisitScope? scope}) {
+    return switch (scope ?? _visitScope) {
       VisitScope.province => division.province.trim(),
       VisitScope.county => division.county.trim(),
       VisitScope.municipality => division.municipality.trim(),
@@ -455,23 +549,27 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   }
 
   String get _activeAreaName {
+    final activeScope = _activeAreaScope;
     final selectedAreaName = _selectedWaypoint == null
         ? ''
-        : _scopeValue(_selectedWaypoint!);
+        : _scopeValue(_selectedWaypoint!, scope: activeScope);
     if (selectedAreaName.isNotEmpty) {
       return selectedAreaName;
     }
 
     final focusedDivision = _focusedDivision;
     if (focusedDivision != null) {
-      final focusedAreaName = _scopeDivisionValue(focusedDivision);
+      final focusedAreaName = _scopeDivisionValue(
+        focusedDivision,
+        scope: activeScope,
+      );
       if (focusedAreaName.isNotEmpty) {
         return focusedAreaName;
       }
     }
 
     for (final waypoint in _waypoints) {
-      final value = _scopeValue(waypoint);
+      final value = _scopeValue(waypoint, scope: activeScope);
       if (value.isNotEmpty) {
         return value;
       }
@@ -482,32 +580,57 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
 
   Iterable<Waypoint> get _activeAreaWaypoints {
     final areaName = _activeAreaName;
-    return _waypoints.where((waypoint) => _scopeValue(waypoint) == areaName);
+    final activeScope = _activeAreaScope;
+    return _waypoints.where(
+      (waypoint) => _scopeValue(waypoint, scope: activeScope) == areaName,
+    );
   }
 
   List<List<LatLng>> get _activeAreaShapes {
+    final localShapes = _localActiveAreaShapes;
+    if (localShapes.isNotEmpty) {
+      return localShapes;
+    }
+
     if (_activeBoundaryPolygons.isNotEmpty) {
       return _activeBoundaryPolygons;
     }
 
-    final positions = _activeAreaWaypoints
-        .map((waypoint) => waypoint.position)
-        .toList(growable: false);
-    if (positions.isNotEmpty) {
-      return [_areaShapeAround(positions)];
-    }
-
-    final focusedPosition = _focusedPosition;
-    if (focusedPosition != null) {
-      return [
-        _areaShapeAround([focusedPosition]),
-      ];
-    }
-
-    return const [];
+    return _fallbackAreaShapes;
   }
 
-  String get _activeBoundaryKey => '$_visitScope:$_activeAreaName';
+  List<List<LatLng>> get _localActiveAreaShapes {
+    return _localBoundaryCache[_localBoundaryKeyFor(
+          _activeAreaScope,
+          _activeAreaName,
+        )] ??
+        const [];
+  }
+
+  List<List<LatLng>> get _fallbackAreaShapes {
+    final position = _activeAreaRepresentativePosition;
+    if (position == null) {
+      return const [];
+    }
+
+    final radiusMeters = switch (_activeAreaScope) {
+      VisitScope.province => 95000.0,
+      VisitScope.county => 22000.0,
+      VisitScope.municipality => 6500.0,
+    };
+
+    return [_circleAround(position, radiusMeters: radiusMeters)];
+  }
+
+  String get _activeBoundaryKey => '$_activeAreaScope:$_activeAreaName';
+
+  double get _activeBoundaryMaxZoom {
+    return switch (_activeAreaScope) {
+      VisitScope.province => 8.0,
+      VisitScope.county => 11.0,
+      VisitScope.municipality => 13.0,
+    };
+  }
 
   LatLng? get _activeAreaRepresentativePosition {
     final selectedWaypoint = _selectedWaypoint;
@@ -548,7 +671,28 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
     return _areaTotalCount == 0 ? 0 : _areaVisitedCount / _areaTotalCount;
   }
 
+  String get _boundaryStatusText {
+    if (_activeAreaName == 'No area data' ||
+        _localActiveAreaShapes.isNotEmpty ||
+        _activeBoundaryPolygons.isNotEmpty) {
+      return '';
+    }
+
+    if (_boundaryLookupPending) {
+      return 'Laduje granice OSM...';
+    }
+
+    final scopeName = switch (_activeAreaScope) {
+      VisitScope.province => 'wojewodztwa',
+      VisitScope.county => 'powiatu',
+      VisitScope.municipality => 'gminy',
+    };
+
+    return 'Brak dokladnej granicy $scopeName - pokazuje przyblizenie';
+  }
+
   Waypoint? _editingWaypoint;
+  final MapController _mapController = MapController();
   LatLng _draftPosition = _initialCenter;
   int _editorRevision = 0;
   int _adminLookupRevision = 0;
@@ -559,18 +703,81 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   LatLng? _focusedPosition;
   int _areaLookupRevision = 0;
   final Map<String, List<List<LatLng>>> _boundaryCache = {};
+  final Map<String, List<List<LatLng>>> _localBoundaryCache = {};
   List<List<LatLng>> _activeBoundaryPolygons = const [];
   String _loadedBoundaryKey = '';
+  bool _boundaryLookupPending = false;
   int _boundaryLookupRevision = 0;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        _refreshAreaBoundary();
+    _loadLocalAdminBoundaries();
+  }
+
+  Future<void> _loadLocalAdminBoundaries() async {
+    final localBoundaries = <String, List<List<LatLng>>>{};
+
+    try {
+      final rawGeoJson = await rootBundle.loadString(
+        _localAdminBoundariesAsset,
+      );
+      final payload = jsonDecode(rawGeoJson);
+      final features = payload is Map<String, dynamic>
+          ? payload['features']
+          : null;
+      if (features is List) {
+        for (final feature in features) {
+          if (feature is! Map<String, dynamic>) {
+            continue;
+          }
+
+          final properties = feature['properties'];
+          if (properties is! Map<String, dynamic>) {
+            continue;
+          }
+
+          final name = (properties['name'] as String?)?.trim() ?? '';
+          final scope = _visitScopeFromBoundaryType(
+            properties['type'] as String?,
+          );
+          if (name.isEmpty || scope == null) {
+            continue;
+          }
+
+          final polygons = _polygonsFromGeoJson(feature['geometry']);
+          if (polygons.isNotEmpty) {
+            localBoundaries[_localBoundaryKeyFor(scope, name)] = polygons;
+          }
+        }
       }
-    });
+    } catch (_) {
+      // Local boundary assets are optional; OSM lookup remains the fallback.
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    if (localBoundaries.isNotEmpty) {
+      setState(() {
+        _localBoundaryCache.addAll(localBoundaries);
+      });
+    }
+    _refreshAreaBoundary();
+  }
+
+  VisitScope? _visitScopeFromBoundaryType(String? type) {
+    return switch ((type ?? '').trim().toLowerCase()) {
+      'province' || 'wojewodztwo' => VisitScope.province,
+      'county' || 'powiat' => VisitScope.county,
+      'municipality' || 'gmina' => VisitScope.municipality,
+      _ => null,
+    };
+  }
+
+  String _localBoundaryKeyFor(VisitScope scope, String areaName) {
+    return '${scope.index}:${_normalizeLocalBoundaryName(scope, areaName)}';
   }
 
   Waypoint? get _selectedWaypoint {
@@ -586,6 +793,15 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
     }
 
     return null;
+  }
+
+  AdminDivision _divisionFromWaypoint(Waypoint waypoint) {
+    return AdminDivision(
+      province: waypoint.province,
+      county: waypoint.county,
+      municipality: waypoint.municipality,
+      city: waypoint.city,
+    );
   }
 
   void _startCreateAt(
@@ -644,6 +860,7 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
 
   void _selectWaypoint(Waypoint waypoint) {
     setState(() {
+      _visitScope = VisitScope.county;
       _selectedWaypointId = waypoint.id;
       _focusedPosition = null;
       _areaLookupRevision++;
@@ -652,7 +869,12 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   }
 
   void _clearSelectedWaypoint() {
+    final selectedWaypoint = _selectedWaypoint;
     setState(() {
+      if (selectedWaypoint != null) {
+        _focusedDivision = _divisionFromWaypoint(selectedWaypoint);
+        _focusedPosition = selectedWaypoint.position;
+      }
       _selectedWaypointId = null;
     });
     _refreshAreaBoundary();
@@ -663,7 +885,6 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
 
     setState(() {
       _selectedWaypointId = null;
-      _focusedDivision = null;
       _focusedPosition = position;
     });
 
@@ -684,17 +905,31 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       setState(() {
         _activeBoundaryPolygons = const [];
         _loadedBoundaryKey = '';
+        _boundaryLookupPending = false;
       });
       return;
     }
 
     final key = _activeBoundaryKey;
+    final localPolygons = _localActiveAreaShapes;
+    if (localPolygons.isNotEmpty) {
+      setState(() {
+        _activeBoundaryPolygons = localPolygons;
+        _loadedBoundaryKey = 'local:$key';
+        _boundaryLookupPending = false;
+      });
+      _fitMapToBoundary(localPolygons, maxZoom: _activeBoundaryMaxZoom);
+      return;
+    }
+
     final cached = _boundaryCache[key];
     if (cached != null) {
       setState(() {
         _activeBoundaryPolygons = cached;
         _loadedBoundaryKey = key;
+        _boundaryLookupPending = false;
       });
+      _fitMapToBoundary(cached, maxZoom: _activeBoundaryMaxZoom);
       return;
     }
 
@@ -704,15 +939,22 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
 
     final lookupId = ++_boundaryLookupRevision;
     final representativePosition = _activeAreaRepresentativePosition;
+    final fallbackShapes = _fallbackAreaShapes;
     if (_loadedBoundaryKey != key && _activeBoundaryPolygons.isNotEmpty) {
       setState(() {
         _activeBoundaryPolygons = const [];
         _loadedBoundaryKey = key;
+        _boundaryLookupPending = true;
+      });
+    } else {
+      setState(() {
+        _boundaryLookupPending = true;
       });
     }
+    _fitMapToBoundary(fallbackShapes, maxZoom: _activeBoundaryMaxZoom);
 
     _lookupAdminBoundary(
-      scope: _visitScope,
+      scope: _activeAreaScope,
       areaName: areaName,
       near: representativePosition,
     ).then((boundary) {
@@ -728,43 +970,66 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
       setState(() {
         _activeBoundaryPolygons = polygons;
         _loadedBoundaryKey = key;
+        _boundaryLookupPending = false;
       });
+      _fitMapToBoundary(polygons, maxZoom: _activeBoundaryMaxZoom);
     });
   }
 
-  List<LatLng> _areaShapeAround(List<LatLng> positions) {
-    final latitudes = positions.map((position) => position.latitude);
-    final longitudes = positions.map((position) => position.longitude);
-    final minLat = latitudes.reduce(math.min);
-    final maxLat = latitudes.reduce(math.max);
-    final minLon = longitudes.reduce(math.min);
-    final maxLon = longitudes.reduce(math.max);
-    final center = LatLng((minLat + maxLat) / 2, (minLon + maxLon) / 2);
-    final paddingMeters = switch (_visitScope) {
-      VisitScope.province => positions.length == 1 ? 18000.0 : 8500.0,
-      VisitScope.county => positions.length == 1 ? 8500.0 : 4200.0,
-      VisitScope.municipality => positions.length == 1 ? 3600.0 : 1800.0,
-    };
-    final latPadding = paddingMeters / 111320;
+  void _fitMapToBoundary(
+    List<List<LatLng>> polygons, {
+    required double maxZoom,
+  }) {
+    final bounds = _boundsForPolygons(polygons);
+    if (bounds == null) {
+      return;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+
+      _mapController.fitCamera(
+        CameraFit.bounds(
+          bounds: bounds,
+          padding: const EdgeInsets.fromLTRB(32, 128, 32, 260),
+          maxZoom: maxZoom,
+        ),
+      );
+    });
+  }
+
+  LatLngBounds? _boundsForPolygons(List<List<LatLng>> polygons) {
+    LatLngBounds? bounds;
+    for (final polygon in polygons) {
+      for (final point in polygon) {
+        bounds ??= LatLngBounds(point, point);
+        bounds.extend(point);
+      }
+    }
+
+    return bounds;
+  }
+
+  List<LatLng> _circleAround(LatLng center, {required double radiusMeters}) {
+    const steps = 64;
+    final points = <LatLng>[];
+    final latRadius = radiusMeters / 111320;
     final lonScale = math.cos(center.latitude * math.pi / 180).abs();
-    final lonPadding = paddingMeters / (111320 * math.max(lonScale, 0.2));
+    final lonRadius = radiusMeters / (111320 * math.max(lonScale, 0.2));
 
-    final west = minLon - lonPadding;
-    final east = maxLon + lonPadding;
-    final north = maxLat + latPadding;
-    final south = minLat - latPadding;
-    final midLat = center.latitude;
-    final midLon = center.longitude;
+    for (var index = 0; index <= steps; index++) {
+      final angle = index * 2 * math.pi / steps;
+      points.add(
+        LatLng(
+          center.latitude + math.sin(angle) * latRadius,
+          center.longitude + math.cos(angle) * lonRadius,
+        ),
+      );
+    }
 
-    return [
-      LatLng(north, midLon - (midLon - west) * 0.35),
-      LatLng(north - (north - midLat) * 0.18, east),
-      LatLng(midLat + (north - midLat) * 0.10, east - (east - midLon) * 0.08),
-      LatLng(south + (midLat - south) * 0.22, east - (east - midLon) * 0.18),
-      LatLng(south, midLon + (east - midLon) * 0.22),
-      LatLng(south + (midLat - south) * 0.16, west),
-      LatLng(midLat + (north - midLat) * 0.18, west + (midLon - west) * 0.06),
-    ];
+    return points;
   }
 
   void _closeEditor() {
@@ -871,8 +1136,14 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
   }
 
   void _setVisitScope(VisitScope scope) {
+    final selectedWaypoint = _selectedWaypoint;
     setState(() {
       _visitScope = scope;
+      if (selectedWaypoint != null) {
+        _selectedWaypointId = null;
+        _focusedDivision = _divisionFromWaypoint(selectedWaypoint);
+        _focusedPosition = selectedWaypoint.position;
+      }
     });
     _refreshAreaBoundary();
   }
@@ -894,12 +1165,11 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-
     return Scaffold(
       body: Stack(
         children: [
           FlutterMap(
+            mapController: _mapController,
             options: MapOptions(
               initialCenter: _initialCenter,
               initialZoom: 13,
@@ -909,6 +1179,10 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
               TileLayer(
                 urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.pietrusiewicz.stadiumly',
+                tileProvider: NetworkTileProvider(
+                  silenceExceptions: true,
+                  cachingProvider: const DisabledMapCachingProvider(),
+                ),
               ),
               if (_activeAreaShapes.isNotEmpty)
                 PolygonLayer(
@@ -916,8 +1190,10 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
                     for (final polygon in _activeAreaShapes)
                       Polygon(
                         points: polygon,
-                        color: colors.primary.withValues(alpha: 0.14),
-                        borderColor: colors.primary.withValues(alpha: 0.76),
+                        color: Colors.transparent,
+                        borderColor: const Color(
+                          0xFF003D99,
+                        ).withValues(alpha: 0.96),
                         borderStrokeWidth: 3,
                       ),
                   ],
@@ -954,6 +1230,7 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
                 selectedWaypoint: _selectedWaypoint,
                 scopeLabel: _scopeLabel,
                 scope: _visitScope,
+                areaShapes: _activeAreaShapes,
                 visitedCount: _areaVisitedCount,
                 totalCount: _areaTotalCount,
                 progress: _progress,
@@ -962,6 +1239,16 @@ class _WaypointMapScreenState extends State<WaypointMapScreen> {
               ),
             ),
           ),
+          if (_boundaryStatusText.isNotEmpty)
+            Positioned(
+              right: 16,
+              top: 96,
+              child: SafeArea(
+                child: IgnorePointer(
+                  child: _MapStatusBadge(text: _boundaryStatusText),
+                ),
+              ),
+            ),
           Align(
             alignment: Alignment.bottomCenter,
             child: SafeArea(
@@ -998,6 +1285,7 @@ class _TripSummary extends StatelessWidget {
     required this.selectedWaypoint,
     required this.scopeLabel,
     required this.scope,
+    required this.areaShapes,
     required this.visitedCount,
     required this.totalCount,
     required this.progress,
@@ -1009,6 +1297,7 @@ class _TripSummary extends StatelessWidget {
   final Waypoint? selectedWaypoint;
   final String scopeLabel;
   final VisitScope scope;
+  final List<List<LatLng>> areaShapes;
   final int visitedCount;
   final int totalCount;
   final double progress;
@@ -1042,8 +1331,8 @@ class _TripSummary extends StatelessWidget {
             Row(
               children: [
                 Container(
-                  width: 52,
-                  height: 52,
+                  width: 68,
+                  height: 68,
                   decoration: BoxDecoration(
                     color: colors.primaryContainer,
                     borderRadius: BorderRadius.circular(8),
@@ -1055,7 +1344,7 @@ class _TripSummary extends StatelessWidget {
                       ),
                     ],
                   ),
-                  padding: const EdgeInsets.all(5),
+                  padding: const EdgeInsets.all(4),
                   child: AnimatedSwitcher(
                     duration: const Duration(milliseconds: 180),
                     child: waypoint == null
@@ -1063,6 +1352,7 @@ class _TripSummary extends StatelessWidget {
                             key: ValueKey('area-shape-$scope-$areaName'),
                             scope: scope,
                             areaName: areaName,
+                            polygons: areaShapes,
                           )
                         : _ObjectShapeIcon(
                             key: ValueKey('object-shape-${waypoint.id}'),
@@ -1126,36 +1416,34 @@ class _TripSummary extends StatelessWidget {
                 ],
               ],
             ),
-            if (waypoint == null) ...[
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: SegmentedButton<VisitScope>(
-                      segments: const [
-                        ButtonSegment(
-                          value: VisitScope.province,
-                          label: Text('Woj'),
-                        ),
-                        ButtonSegment(
-                          value: VisitScope.county,
-                          label: Text('Powiat'),
-                        ),
-                        ButtonSegment(
-                          value: VisitScope.municipality,
-                          label: Text('Gmina'),
-                        ),
-                      ],
-                      selected: {scope},
-                      showSelectedIcon: false,
-                      onSelectionChanged: (selection) {
-                        onScopeChanged(selection.single);
-                      },
-                    ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: SegmentedButton<VisitScope>(
+                    segments: const [
+                      ButtonSegment(
+                        value: VisitScope.province,
+                        label: Text('Woj'),
+                      ),
+                      ButtonSegment(
+                        value: VisitScope.county,
+                        label: Text('Powiat'),
+                      ),
+                      ButtonSegment(
+                        value: VisitScope.municipality,
+                        label: Text('Gmina'),
+                      ),
+                    ],
+                    selected: {scope},
+                    showSelectedIcon: false,
+                    onSelectionChanged: (selection) {
+                      onScopeChanged(selection.single);
+                    },
                   ),
-                ],
-              ),
-            ],
+                ),
+              ],
+            ),
             if (waypoint == null) ...[
               const SizedBox(height: 12),
               ClipRRect(
@@ -1303,10 +1591,12 @@ class _AreaShapeIcon extends StatelessWidget {
     super.key,
     required this.scope,
     required this.areaName,
+    required this.polygons,
   });
 
   final VisitScope scope;
   final String areaName;
+  final List<List<LatLng>> polygons;
 
   @override
   Widget build(BuildContext context) {
@@ -1317,8 +1607,63 @@ class _AreaShapeIcon extends StatelessWidget {
         painter: _AreaShapePainter(
           scope: scope,
           areaName: areaName,
+          polygons: polygons,
           fillColor: colors.primary,
           strokeColor: colors.onPrimaryContainer,
+        ),
+      ),
+    );
+  }
+}
+
+class _MapStatusBadge extends StatelessWidget {
+  const _MapStatusBadge({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final loading = text.startsWith('Laduje');
+
+    return Material(
+      elevation: 4,
+      color: colors.surface.withValues(alpha: 0.94),
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 14,
+              height: 14,
+              child: loading
+                  ? CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: colors.primary,
+                    )
+                  : Icon(
+                      Icons.info_outline,
+                      size: 14,
+                      color: colors.onSurfaceVariant,
+                    ),
+            ),
+            const SizedBox(width: 8),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 280),
+              child: Text(
+                text,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: colors.onSurfaceVariant,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -1329,19 +1674,22 @@ class _AreaShapePainter extends CustomPainter {
   const _AreaShapePainter({
     required this.scope,
     required this.areaName,
+    required this.polygons,
     required this.fillColor,
     required this.strokeColor,
   });
 
   final VisitScope scope;
   final String areaName;
+  final List<List<LatLng>> polygons;
   final Color fillColor;
   final Color strokeColor;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final shape = _shapeFor(scope, areaName);
-    final path = _smoothedPath(shape, size);
+    final path = polygons.isEmpty
+        ? _smoothedPath(_shapeFor(scope, areaName), size)
+        : _boundaryPath(polygons, size);
 
     final shadowPath = path.shift(const Offset(0, 1));
     canvas.drawPath(
@@ -1373,6 +1721,88 @@ class _AreaShapePainter extends CustomPainter {
         ..strokeWidth = 1.6
         ..style = PaintingStyle.stroke
         ..strokeJoin = StrokeJoin.round,
+    );
+  }
+
+  ui.Path _boundaryPath(List<List<LatLng>> polygons, Size size) {
+    final bounds = _boundsForIcon(polygons);
+    if (bounds == null) {
+      return _smoothedPath(_shapeFor(scope, areaName), size);
+    }
+
+    final width = bounds.maxLongitude - bounds.minLongitude;
+    final height = bounds.maxLatitude - bounds.minLatitude;
+    if (width <= 0 || height <= 0) {
+      return _smoothedPath(_shapeFor(scope, areaName), size);
+    }
+
+    final scale = math.min(size.width / width, size.height / height) * 0.86;
+    final drawnWidth = width * scale;
+    final drawnHeight = height * scale;
+    final offsetX = (size.width - drawnWidth) / 2;
+    final offsetY = (size.height - drawnHeight) / 2;
+
+    Offset project(LatLng point) {
+      return Offset(
+        offsetX + (point.longitude - bounds.minLongitude) * scale,
+        offsetY + (bounds.maxLatitude - point.latitude) * scale,
+      );
+    }
+
+    final path = ui.Path();
+    for (final polygon in polygons) {
+      if (polygon.length < 3) {
+        continue;
+      }
+
+      final step = math.max(1, (polygon.length / 220).ceil());
+      final first = project(polygon.first);
+      path.moveTo(first.dx, first.dy);
+      for (var index = step; index < polygon.length; index += step) {
+        final point = project(polygon[index]);
+        path.lineTo(point.dx, point.dy);
+      }
+      path.close();
+    }
+
+    return path;
+  }
+
+  _IconBounds? _boundsForIcon(List<List<LatLng>> polygons) {
+    double? minLatitude;
+    double? maxLatitude;
+    double? minLongitude;
+    double? maxLongitude;
+
+    for (final polygon in polygons) {
+      for (final point in polygon) {
+        minLatitude = minLatitude == null
+            ? point.latitude
+            : math.min(minLatitude, point.latitude);
+        maxLatitude = maxLatitude == null
+            ? point.latitude
+            : math.max(maxLatitude, point.latitude);
+        minLongitude = minLongitude == null
+            ? point.longitude
+            : math.min(minLongitude, point.longitude);
+        maxLongitude = maxLongitude == null
+            ? point.longitude
+            : math.max(maxLongitude, point.longitude);
+      }
+    }
+
+    if (minLatitude == null ||
+        maxLatitude == null ||
+        minLongitude == null ||
+        maxLongitude == null) {
+      return null;
+    }
+
+    return _IconBounds(
+      minLatitude: minLatitude,
+      maxLatitude: maxLatitude,
+      minLongitude: minLongitude,
+      maxLongitude: maxLongitude,
     );
   }
 
@@ -1566,9 +1996,24 @@ class _AreaShapePainter extends CustomPainter {
   bool shouldRepaint(covariant _AreaShapePainter oldDelegate) {
     return oldDelegate.scope != scope ||
         oldDelegate.areaName != areaName ||
+        oldDelegate.polygons != polygons ||
         oldDelegate.fillColor != fillColor ||
         oldDelegate.strokeColor != strokeColor;
   }
+}
+
+class _IconBounds {
+  const _IconBounds({
+    required this.minLatitude,
+    required this.maxLatitude,
+    required this.minLongitude,
+    required this.maxLongitude,
+  });
+
+  final double minLatitude;
+  final double maxLatitude;
+  final double minLongitude;
+  final double maxLongitude;
 }
 
 class _WaypointMarker extends StatelessWidget {
